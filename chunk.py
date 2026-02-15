@@ -236,6 +236,23 @@ def extract_section_content(section: nodes.section) -> str:
     return "\n\n".join(p for p in parts if p.strip())
 
 
+def node_line_range(node: nodes.Node) -> tuple[int | None, int | None]:
+    """Return min/max source line numbers from node subtree."""
+    lines: list[int] = []
+    own = getattr(node, "line", None)
+    if isinstance(own, int):
+        lines.append(own)
+
+    for child in node.findall():
+        ln = getattr(child, "line", None)
+        if isinstance(ln, int):
+            lines.append(ln)
+
+    if not lines:
+        return None, None
+    return min(lines), max(lines)
+
+
 def get_section_title(section: nodes.section) -> str:
     """Get section title text."""
     for child in section.children:
@@ -356,14 +373,37 @@ def merge_tiny_chunks(chunks: list[dict], min_size: int, max_size: int) -> list[
     if len(chunks) <= 1:
         return chunks
 
+    def _can_merge(a: dict, b: dict) -> bool:
+        a_meta = a.get("metadata", {})
+        b_meta = b.get("metadata", {})
+        return a_meta.get("source") == b_meta.get("source")
+
+    def _merge_metadata(a: dict, b: dict) -> None:
+        a_meta = a.get("metadata", {})
+        b_meta = b.get("metadata", {})
+
+        a_start = a_meta.get("line_start")
+        b_start = b_meta.get("line_start")
+        a_end = a_meta.get("line_end")
+        b_end = b_meta.get("line_end")
+
+        starts = [v for v in (a_start, b_start) if isinstance(v, int)]
+        ends = [v for v in (a_end, b_end) if isinstance(v, int)]
+
+        if starts:
+            a_meta["line_start"] = min(starts)
+        if ends:
+            a_meta["line_end"] = max(ends)
+
     # Pass 1: merge backward
     backward: list[dict] = []
     for chunk in chunks:
         if len(chunk["text"]) < min_size and backward:
             prev = backward[-1]
             combined = prev["text"] + "\n\n" + chunk["text"]
-            if len(combined) <= max_size:
+            if len(combined) <= max_size and _can_merge(prev, chunk):
                 prev["text"] = combined
+                _merge_metadata(prev, chunk)
                 continue
         backward.append(chunk)
 
@@ -377,8 +417,9 @@ def merge_tiny_chunks(chunks: list[dict], min_size: int, max_size: int) -> list[
         if len(chunk["text"]) < min_size and i + 1 < len(backward):
             nxt = backward[i + 1]
             combined = chunk["text"] + "\n\n" + nxt["text"]
-            if len(combined) <= max_size:
+            if len(combined) <= max_size and _can_merge(chunk, nxt):
                 nxt["text"] = combined
+                _merge_metadata(nxt, chunk)
                 continue  # tiny chunk absorbed into next; next will be added normally
         forward.append(chunk)
 
@@ -397,6 +438,15 @@ def chunk_document(doctree: nodes.document, source_file: str) -> list[dict]:
         current_breadcrumb = breadcrumb + [title] if title else breadcrumb
         breadcrumb_str = " > ".join(current_breadcrumb)
 
+        section_children = [
+            child for child in section.children if not isinstance(child, nodes.section)
+        ]
+        section_ranges = [node_line_range(child) for child in section_children]
+        section_starts = [start for start, _ in section_ranges if isinstance(start, int)]
+        section_ends = [end for _, end in section_ranges if isinstance(end, int)]
+        line_start = min(section_starts) if section_starts else None
+        line_end = max(section_ends) if section_ends else None
+
         # Get this section's own content (excluding nested sections)
         content = extract_section_content(section)
 
@@ -412,6 +462,8 @@ def chunk_document(doctree: nodes.document, source_file: str) -> list[dict]:
                     "metadata": {
                         "source": source_file,
                         "breadcrumb": breadcrumb_str,
+                        **({"line_start": line_start} if line_start is not None else {}),
+                        **({"line_end": line_end} if line_end is not None else {}),
                     },
                 })
                 chunk_counter += 1
@@ -430,6 +482,8 @@ def chunk_document(doctree: nodes.document, source_file: str) -> list[dict]:
                             "source": source_file,
                             "breadcrumb": breadcrumb_str,
                             "part": i + 1,
+                            **({"line_start": line_start} if line_start is not None else {}),
+                            **({"line_end": line_end} if line_end is not None else {}),
                         },
                     })
                     chunk_counter += 1
@@ -441,6 +495,7 @@ def chunk_document(doctree: nodes.document, source_file: str) -> list[dict]:
 
     # Handle top-level content (before any section)
     top_content_parts: list[str] = []
+    top_nodes: list[nodes.Node] = []
     for child in doctree.children:
         if isinstance(child, nodes.section):
             _process_section(child, [])
@@ -448,6 +503,13 @@ def chunk_document(doctree: nodes.document, source_file: str) -> list[dict]:
             text = node_to_text(child)
             if text.strip():
                 top_content_parts.append(text)
+                top_nodes.append(child)
+
+    top_ranges = [node_line_range(node) for node in top_nodes]
+    top_starts = [start for start, _ in top_ranges if isinstance(start, int)]
+    top_ends = [end for _, end in top_ranges if isinstance(end, int)]
+    top_line_start = min(top_starts) if top_starts else None
+    top_line_end = max(top_ends) if top_ends else None
 
     if top_content_parts:
         top_content = "\n\n".join(top_content_parts)
@@ -459,6 +521,8 @@ def chunk_document(doctree: nodes.document, source_file: str) -> list[dict]:
                 "metadata": {
                     "source": source_file,
                     "breadcrumb": "(top-level)",
+                    **({"line_start": top_line_start} if top_line_start is not None else {}),
+                    **({"line_end": top_line_end} if top_line_end is not None else {}),
                 },
             })
         else:
@@ -476,6 +540,8 @@ def chunk_document(doctree: nodes.document, source_file: str) -> list[dict]:
                         "source": source_file,
                         "breadcrumb": "(top-level)",
                         "part": i + 1,
+                        **({"line_start": top_line_start} if top_line_start is not None else {}),
+                        **({"line_end": top_line_end} if top_line_end is not None else {}),
                     },
                 })
                 chunk_counter += 1
@@ -484,6 +550,40 @@ def chunk_document(doctree: nodes.document, source_file: str) -> list[dict]:
     chunks = merge_tiny_chunks(chunks, MIN_CHUNK_SIZE, MAX_CHUNK_SIZE)
 
     return chunks
+
+
+def _char_pos_to_line_number(text: str, pos: int) -> int:
+    """Convert 0-based character position to 1-based line number."""
+    if pos <= 0:
+        return 1
+    return text.count("\n", 0, pos) + 1
+
+
+def add_line_spans(chunks: list[dict], full_text: str) -> None:
+    """Annotate chunk metadata with line_start/line_end based on full text."""
+    if not chunks or not full_text:
+        return
+
+    cursor = 0
+    for chunk in chunks:
+        text = chunk.get("text", "")
+        if not text:
+            continue
+
+        idx = full_text.find(text, cursor)
+        if idx == -1:
+            idx = full_text.find(text)
+            if idx == -1:
+                continue
+
+        line_start = _char_pos_to_line_number(full_text, idx)
+        line_end = _char_pos_to_line_number(full_text, idx + len(text))
+
+        meta = chunk.setdefault("metadata", {})
+        meta["line_start"] = line_start
+        meta["line_end"] = line_end
+
+        cursor = idx + len(text)
 
 
 # ── File collection ────────────────────────────────────────────────
@@ -549,6 +649,7 @@ def main():
                 # Convert relative path for metadata
                 rel_path = str(filepath.relative_to(DOCS_DIR))
                 file_chunks = chunk_document(doctree, rel_path)
+                add_line_spans(file_chunks, text)
                 all_chunks.extend(file_chunks)
 
             except Exception as e:
