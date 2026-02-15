@@ -32,6 +32,8 @@ DEFAULT_TOP_K = 5
 DEFAULT_PAGEINDEX_NODES = Path("data/pageindex/nodes.jsonl")
 DEFAULT_PAGEINDEX_MODEL = "local-model"
 DEFAULT_HYBRID_BASE_URL = DEFAULT_BASE_URL
+DEFAULT_HYBRID_EMBED_BASE_URL = "http://localhost:8059/v1"
+DEFAULT_HYBRID_LLM_BASE_URL = "http://localhost:4321/v1"
 DEFAULT_HYBRID_VECTOR_TOP_N = 40
 DEFAULT_HYBRID_CANDIDATE_CAP = 30
 DEFAULT_HYBRID_NEIGHBOR_DEPTH = 1
@@ -228,6 +230,8 @@ class HybridPredictor(Predictor):
         *,
         nodes_file: Path,
         base_url: str,
+        embed_base_url: str | None,
+        llm_base_url: str | None,
         model: str,
         chroma_dir: Path,
         collection: str,
@@ -237,6 +241,8 @@ class HybridPredictor(Predictor):
         neighbor_depth: int,
         siblings_per_node: int,
         no_llm: bool,
+        summary_chars: int,
+        text_chars: int,
     ):
         super().__init__()
         if not nodes_file.is_file():
@@ -245,6 +251,8 @@ class HybridPredictor(Predictor):
         self.retriever = HybridRetriever(
             nodes,
             base_url=base_url,
+            embed_base_url=embed_base_url,
+            llm_base_url=llm_base_url,
             model=model,
             chroma_dir=chroma_dir,
             collection=collection,
@@ -254,6 +262,8 @@ class HybridPredictor(Predictor):
             candidate_cap=candidate_cap,
             neighbor_depth=neighbor_depth,
             siblings_per_node=siblings_per_node,
+            summary_chars=summary_chars,
+            text_chars=text_chars,
         )
 
     def predict(self, query: str, top_k: int) -> list[Hit]:
@@ -350,6 +360,8 @@ def main() -> None:
     parser.add_argument("--pageindex-step-text-chars", type=int, default=900, help="Body excerpt chars per candidate during tree traversal")
     parser.add_argument("--pageindex-final-text-chars", type=int, default=1500, help="Body excerpt chars per candidate during final ranking")
     parser.add_argument("--hybrid-base-url", default=DEFAULT_HYBRID_BASE_URL, help="API URL for hybrid embedding/LLM calls")
+    parser.add_argument("--hybrid-embed-base-url", default=DEFAULT_HYBRID_EMBED_BASE_URL, help="Embedding API URL for hybrid")
+    parser.add_argument("--hybrid-llm-base-url", default=DEFAULT_HYBRID_LLM_BASE_URL, help="LLM API URL for hybrid")
     parser.add_argument("--hybrid-model", default=DEFAULT_PAGEINDEX_MODEL, help="Model name for hybrid LLM rerank")
     parser.add_argument("--hybrid-vector-top-n", type=int, default=DEFAULT_HYBRID_VECTOR_TOP_N, help="Vector shortlist size for hybrid")
     parser.add_argument("--hybrid-candidate-cap", type=int, default=DEFAULT_HYBRID_CANDIDATE_CAP, help="Max candidates kept before final hybrid rerank")
@@ -402,6 +414,8 @@ def main() -> None:
         predictor = HybridPredictor(
             nodes_file=args.hybrid_nodes,
             base_url=args.hybrid_base_url,
+            embed_base_url=args.hybrid_embed_base_url,
+            llm_base_url=args.hybrid_llm_base_url,
             model=args.hybrid_model,
             chroma_dir=args.chroma_dir,
             collection=args.collection,

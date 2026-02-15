@@ -19,6 +19,8 @@ DEFAULT_BASE_URL = "http://localhost:8052/v1"
 DEFAULT_MODEL = "local-model"
 DEFAULT_NODES_FILE = Path("data/pageindex/nodes.jsonl")
 DEFAULT_CHUNKS_FILE = Path("data/chunks.jsonl")
+DEFAULT_HYBRID_EMBED_BASE_URL = "http://localhost:8059/v1"
+DEFAULT_HYBRID_LLM_BASE_URL = "http://localhost:4321/v1"
 
 
 def make_handler(retrieve_fn):
@@ -110,6 +112,10 @@ def main() -> None:
     parser.add_argument("--hybrid-candidate-cap", type=int, default=30, help="Candidate cap before rerank in hybrid mode")
     parser.add_argument("--hybrid-neighbor-depth", type=int, default=1, help="Neighbor expansion depth in hybrid mode")
     parser.add_argument("--hybrid-siblings-per-node", type=int, default=2, help="Sibling cap per node in hybrid mode")
+    parser.add_argument("--hybrid-embed-base-url", default=DEFAULT_HYBRID_EMBED_BASE_URL, help="Embedding API URL for hybrid mode")
+    parser.add_argument("--hybrid-llm-base-url", default=DEFAULT_HYBRID_LLM_BASE_URL, help="LLM API URL for hybrid mode")
+    parser.add_argument("--hybrid-final-summary-chars", type=int, default=420, help="Summary chars per candidate in hybrid final rerank")
+    parser.add_argument("--hybrid-final-text-chars", type=int, default=1500, help="Body excerpt chars per candidate in hybrid final rerank")
     parser.add_argument("--hybrid-no-llm", action="store_true", help="Disable hybrid LLM rerank")
     args = parser.parse_args()
 
@@ -139,6 +145,8 @@ def main() -> None:
         retriever = HybridRetriever(
             nodes,
             base_url=args.base_url,
+            embed_base_url=args.hybrid_embed_base_url,
+            llm_base_url=args.hybrid_llm_base_url,
             model=args.model,
             chroma_dir=args.chroma_dir,
             collection=args.collection,
@@ -148,6 +156,8 @@ def main() -> None:
             candidate_cap=args.hybrid_candidate_cap,
             neighbor_depth=args.hybrid_neighbor_depth,
             siblings_per_node=args.hybrid_siblings_per_node,
+            summary_chars=args.hybrid_final_summary_chars,
+            text_chars=args.hybrid_final_text_chars,
         )
 
         def retrieve_fn(query: str, top_k: int):

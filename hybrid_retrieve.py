@@ -6,16 +6,24 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import chromadb
 from openai import OpenAI
+from rich.console import Console
+from rich.panel import Panel
 
-from pageindex_common import QUERY_PREFIX, RetrievedHit, lexical_score, parse_json_obj
+from pageindex_common import QUERY_PREFIX, RetrievedHit, lexical_score, load_nodes, parse_json_obj
 
 
 DEFAULT_CHROMA_DIR = Path("data/chroma")
 DEFAULT_COLLECTION = "symfony_docs"
 DEFAULT_CHUNKS_FILE = Path("data/chunks.jsonl")
+DEFAULT_NODES_FILE = Path("data/pageindex/nodes.jsonl")
+DEFAULT_BASE_URL = "http://localhost:8059/v1"
+DEFAULT_EMBED_BASE_URL = "http://localhost:8059/v1"
+DEFAULT_LLM_BASE_URL = "http://localhost:4321/v1"
+DEFAULT_MODEL = "local-model"
 
 
 @dataclass
@@ -27,9 +35,16 @@ class _NodeEvidence:
 
 
 def _line_overlap(a_start: int | None, a_end: int | None, b_start: int | None, b_end: int | None) -> bool:
-    if not all(isinstance(v, int) for v in (a_start, a_end, b_start, b_end)):
+    if not isinstance(a_start, int) or not isinstance(a_end, int):
+        return False
+    if not isinstance(b_start, int) or not isinstance(b_end, int):
         return False
     return max(a_start, b_start) <= min(a_end, b_end)
+
+
+def _line_start_key(node: dict[str, Any]) -> int:
+    line_start = node.get("line_start")
+    return line_start if isinstance(line_start, int) else 10**9
 
 
 class HybridRetriever:
@@ -39,6 +54,8 @@ class HybridRetriever:
         *,
         base_url: str,
         model: str,
+        embed_base_url: str | None = None,
+        llm_base_url: str | None = None,
         chroma_dir: Path = DEFAULT_CHROMA_DIR,
         collection: str = DEFAULT_COLLECTION,
         chunks_file: Path = DEFAULT_CHUNKS_FILE,
@@ -61,8 +78,10 @@ class HybridRetriever:
         self.candidate_file_roots = candidate_file_roots
         self.summary_chars = summary_chars
         self.text_chars = text_chars
-        self.embedding_client = OpenAI(base_url=base_url, api_key="not-needed")
-        self.llm_client = OpenAI(base_url=base_url, api_key="not-needed") if use_llm else None
+        embed_url = embed_base_url or base_url
+        llm_url = llm_base_url or base_url
+        self.embedding_client = OpenAI(base_url=embed_url, api_key="not-needed")
+        self.llm_client = OpenAI(base_url=llm_url, api_key="not-needed") if use_llm else None
         self._llm_cache: dict[str, list[str]] = {}
         self._usage = {"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -101,7 +120,7 @@ class HybridRetriever:
                 continue
             by_source.setdefault(str(source), []).append(n)
         for source, values in by_source.items():
-            by_source[source] = sorted(values, key=lambda x: x.get("line_start") if isinstance(x.get("line_start"), int) else 10**9)
+            by_source[source] = sorted(values, key=_line_start_key)
         return by_source
 
     def _index_file_roots(self) -> dict[str, str]:
@@ -117,7 +136,10 @@ class HybridRetriever:
             enriched = f"{query} (Symfony PHP framework)"
         prefixed = f"{QUERY_PREFIX}{enriched}"
         response = self.embedding_client.embeddings.create(input=[prefixed], model="CodeRankEmbed")
-        return response.data[0].embedding
+        data = getattr(response, "data", []) or []
+        if not data:
+            raise RuntimeError("Embedding API returned no vectors")
+        return data[0].embedding
 
     def _candidate_text(self, node: dict) -> str:
         return "\n".join(
@@ -154,9 +176,12 @@ class HybridRetriever:
             include=["metadatas", "distances"],
         )
 
-        ids = result.get("ids", [[]])[0] if result.get("ids") else []
-        metadatas = result.get("metadatas", [[]])[0] if result.get("metadatas") else []
-        distances = result.get("distances", [[]])[0] if result.get("distances") else []
+        ids_raw = result.get("ids") or [[]]
+        metadatas_raw = result.get("metadatas") or [[]]
+        distances_raw = result.get("distances") or [[]]
+        ids = ids_raw[0] if ids_raw else []
+        metadatas = metadatas_raw[0] if metadatas_raw else []
+        distances = distances_raw[0] if distances_raw else []
 
         evidence: dict[str, _NodeEvidence] = {}
         file_scores: dict[str, float] = {}
@@ -384,3 +409,121 @@ class HybridRetriever:
                 )
             )
         return hits
+
+
+def _content_preview(text: str, max_chars: int) -> str:
+    cleaned = " ".join((text or "").split())
+    if not cleaned:
+        return "(no extracted content)"
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[: max_chars - 3].rstrip() + "..."
+
+
+def display_hits(console: Console, query: str, hits: list[RetrievedHit], top_k: int, content_chars: int) -> None:
+    console.print()
+    console.print(Panel(f"[bold]{query}[/]", title="Query", border_style="blue"))
+    if not hits:
+        console.print("[yellow]No results.[/]")
+        return
+
+    for i, h in enumerate(hits, 1):
+        header = f"[bold cyan]#{i}[/] [dim]score:[/] {h.score:.4f} [dim]dist:[/] {h.distance:.4f}"
+        source = h.source
+        if h.line_start is not None and h.line_end is not None:
+            source += f":{h.line_start}-{h.line_end}"
+        snippet = _content_preview(h.text, content_chars)
+        body = f"[bold]{source}[/]\n[dim]{h.breadcrumb or ''}[/]\n\n{h.title}\n\n[dim]Content:[/] {snippet}"
+        console.print(Panel(body, title=header, border_style="dim", padding=(0, 1)))
+
+    console.print(f"[dim]Showing {min(len(hits), top_k)} results[/]")
+
+
+def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Retrieve from hybrid vector+PageIndex pipeline")
+    parser.add_argument("--nodes-file", type=Path, default=DEFAULT_NODES_FILE, help="Path to pageindex nodes.jsonl")
+    parser.add_argument("--chroma-dir", type=Path, default=DEFAULT_CHROMA_DIR, help="Chroma directory")
+    parser.add_argument("--collection", default=DEFAULT_COLLECTION, help="Chroma collection")
+    parser.add_argument("--chunks-file", type=Path, default=DEFAULT_CHUNKS_FILE, help="chunks.jsonl for chunk->node mapping")
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Fallback base URL for embedding/LLM calls")
+    parser.add_argument("--embed-base-url", default=DEFAULT_EMBED_BASE_URL, help="Embedding API URL")
+    parser.add_argument("--llm-base-url", default=DEFAULT_LLM_BASE_URL, help="LLM API URL")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="LLM model name")
+    parser.add_argument("--top-k", type=int, default=5, help="Number of results")
+    parser.add_argument("--vector-top-n", type=int, default=40, help="Vector shortlist size")
+    parser.add_argument("--candidate-cap", type=int, default=30, help="Max candidates before final rerank")
+    parser.add_argument("--neighbor-depth", type=int, default=1, help="Neighbor expansion depth")
+    parser.add_argument("--siblings-per-node", type=int, default=2, help="Sibling cap per expanded node")
+    parser.add_argument("--final-summary-chars", type=int, default=420, help="Summary chars per candidate for hybrid final rerank")
+    parser.add_argument("--final-text-chars", type=int, default=1500, help="Body excerpt chars per candidate for hybrid final rerank")
+    parser.add_argument("--content-chars", type=int, default=500, help="Max chars to show per result content")
+    parser.add_argument("--no-llm", action="store_true", help="Disable hybrid LLM rerank")
+    parser.add_argument("query", nargs="*", help="One-shot query")
+    args = parser.parse_args()
+
+    console = Console()
+    if not args.nodes_file.is_file():
+        raise SystemExit(f"Index file not found: {args.nodes_file}. Run pageindex_build.py first.")
+
+    nodes = load_nodes(args.nodes_file)
+    retriever = HybridRetriever(
+        nodes,
+        base_url=args.base_url,
+        embed_base_url=args.embed_base_url,
+        llm_base_url=args.llm_base_url,
+        model=args.model,
+        chroma_dir=args.chroma_dir,
+        collection=args.collection,
+        chunks_file=args.chunks_file,
+        use_llm=not args.no_llm,
+        vector_top_n=args.vector_top_n,
+        candidate_cap=args.candidate_cap,
+        neighbor_depth=args.neighbor_depth,
+        siblings_per_node=args.siblings_per_node,
+        summary_chars=args.final_summary_chars,
+        text_chars=args.final_text_chars,
+    )
+
+    if args.query:
+        query = " ".join(args.query)
+        hits = retriever.retrieve(query, top_k=args.top_k)
+        display_hits(console, query, hits, args.top_k, args.content_chars)
+        return
+
+    console.print("[bold]Hybrid Retrieval REPL[/]")
+    console.print("Commands: [dim]:quit, :top N, :help[/]\n")
+
+    top_k = args.top_k
+    while True:
+        try:
+            query = console.input("[bold green]query>[/] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[dim]Bye![/]")
+            break
+
+        if not query:
+            continue
+        if query in {":quit", ":q"}:
+            console.print("[dim]Bye![/]")
+            break
+        if query in {":help", ":h"}:
+            console.print("[dim]Commands:[/]")
+            console.print("  :quit / :q     - exit")
+            console.print("  :top N         - set top-k")
+            continue
+        if query.startswith(":top "):
+            try:
+                top_k = int(query.split()[1])
+                console.print(f"[dim]top_k={top_k}[/]")
+            except Exception:
+                console.print("[red]Usage: :top N[/]")
+            continue
+
+        hits = retriever.retrieve(query, top_k=top_k)
+        display_hits(console, query, hits, top_k, args.content_chars)
+
+
+if __name__ == "__main__":
+    main()
