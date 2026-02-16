@@ -119,6 +119,10 @@ def main() -> None:
     parser.add_argument("--hybrid-rrf-k", type=int, default=60, help="RRF constant for hybrid vector(summary)/tree + BM25 fusion")
     parser.add_argument("--hybrid-rrf-vector-weight", type=float, default=1.0, help="RRF weight for hybrid vector(summary)/tree branch")
     parser.add_argument("--hybrid-rrf-bm25-weight", type=float, default=1.0, help="RRF weight for hybrid BM25 branch")
+    parser.add_argument("--hybrid-hyde-variants", type=int, default=0, help="HyDE variant count for hybrid dense retrieval (0 disables)")
+    parser.add_argument("--hybrid-hyde-variant-weight", type=float, default=0.7, help="Score weight applied to each hybrid HyDE variant")
+    parser.add_argument("--hybrid-hyde-temperature", type=float, default=0.3, help="Temperature for hybrid HyDE generation")
+    parser.add_argument("--hybrid-hyde-max-chars", type=int, default=420, help="Max chars kept per hybrid HyDE synthetic document")
     parser.add_argument("--hybrid-no-llm", action="store_true", help="Disable hybrid LLM rerank")
     args = parser.parse_args()
 
@@ -164,6 +168,10 @@ def main() -> None:
             rrf_k=args.hybrid_rrf_k,
             rrf_vector_weight=args.hybrid_rrf_vector_weight,
             rrf_bm25_weight=args.hybrid_rrf_bm25_weight,
+            hyde_variants=args.hybrid_hyde_variants,
+            hyde_variant_weight=args.hybrid_hyde_variant_weight,
+            hyde_temperature=args.hybrid_hyde_temperature,
+            hyde_max_chars=args.hybrid_hyde_max_chars,
         )
 
         def retrieve_fn(query: str, top_k: int):

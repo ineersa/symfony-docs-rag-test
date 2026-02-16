@@ -26,6 +26,11 @@ DEFAULT_LLM_BASE_URL = "http://localhost:4321/v1"
 DEFAULT_MODEL = "local-model"
 DEFAULT_BM25_TOP_N = 80
 DEFAULT_RRF_K = 60
+DEFAULT_HYDE_VARIANTS = 0
+DEFAULT_HYDE_VARIANT_WEIGHT = 0.7
+DEFAULT_HYDE_TEMPERATURE = 0.3
+DEFAULT_HYDE_MAX_CHARS = 420
+DEFAULT_HYDE_JSON_RETRIES = 2
 
 
 @dataclass
@@ -59,6 +64,10 @@ class HybridRetriever:
         rrf_k: int = DEFAULT_RRF_K,
         rrf_vector_weight: float = 1.0,
         rrf_bm25_weight: float = 1.0,
+        hyde_variants: int = DEFAULT_HYDE_VARIANTS,
+        hyde_variant_weight: float = DEFAULT_HYDE_VARIANT_WEIGHT,
+        hyde_temperature: float = DEFAULT_HYDE_TEMPERATURE,
+        hyde_max_chars: int = DEFAULT_HYDE_MAX_CHARS,
     ):
         self.nodes = nodes
         self.model = model
@@ -74,11 +83,16 @@ class HybridRetriever:
         self.rrf_k = max(1, rrf_k)
         self.rrf_vector_weight = max(0.0, rrf_vector_weight)
         self.rrf_bm25_weight = max(0.0, rrf_bm25_weight)
+        self.hyde_variants = max(0, hyde_variants)
+        self.hyde_variant_weight = max(0.0, hyde_variant_weight)
+        self.hyde_temperature = max(0.0, min(1.0, hyde_temperature))
+        self.hyde_max_chars = max(80, hyde_max_chars)
         embed_url = embed_base_url or base_url
         llm_url = llm_base_url or base_url
         self.embedding_client = OpenAI(base_url=embed_url, api_key="not-needed")
-        self.llm_client = OpenAI(base_url=llm_url, api_key="not-needed") if use_llm else None
+        self.llm_client = OpenAI(base_url=llm_url, api_key="not-needed") if (use_llm or self.hyde_variants > 0) else None
         self._llm_cache: dict[str, list[str]] = {}
+        self._hyde_cache: dict[str, list[str]] = {}
         self._usage = {"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
         chroma_client = chromadb.PersistentClient(path=str(chroma_dir))
@@ -99,16 +113,89 @@ class HybridRetriever:
                 out[str(n["source"])] = str(n["id"])
         return out
 
-    def _embed_query(self, query: str) -> list[float]:
+    @staticmethod
+    def _clip(text: str, max_chars: int) -> str:
+        clean = " ".join((text or "").split())
+        if len(clean) <= max_chars:
+            return clean
+        return clean[: max_chars - 3].rstrip() + "..."
+
+    def _enriched_prefixed_query(self, query: str) -> str:
         enriched = query
         if "symfony" not in query.lower():
             enriched = f"{query} (Symfony PHP framework)"
-        prefixed = f"{QUERY_PREFIX}{enriched}"
-        response = self.embedding_client.embeddings.create(input=[prefixed], model="CodeRankEmbed")
+        return f"{QUERY_PREFIX}{enriched}"
+
+    def _embed_queries(self, queries: list[str]) -> list[list[float]]:
+        if not queries:
+            return []
+        prefixed = [self._enriched_prefixed_query(q) for q in queries]
+        response = self.embedding_client.embeddings.create(input=prefixed, model="CodeRankEmbed")
         data = getattr(response, "data", []) or []
         if not data:
             raise RuntimeError("Embedding API returned no vectors")
-        return data[0].embedding
+        return [item.embedding for item in data]
+
+    def _hyde_generate_variants(self, query: str) -> list[str]:
+        if self.hyde_variants <= 0 or not self.llm_client:
+            return []
+
+        cache_key = f"hyde|{query}|{self.hyde_variants}|{self.hyde_temperature}|{self.hyde_max_chars}"
+        if cache_key in self._hyde_cache:
+            return self._hyde_cache[cache_key]
+
+        prompt = (
+            "Generate hypothetical documentation snippets for retrieval. "
+            "Write concise pseudo-document summaries likely to contain the answer. "
+            "Focus on Symfony docs style (headings, config keys, command names, concrete steps). "
+            "Do not answer the user directly. "
+            "Return ONLY JSON with shape: {\"documents\": [..]}.\n\n"
+            f"Query: {query}\n"
+            f"Count: {self.hyde_variants}"
+        )
+
+        out: list[str] = []
+        max_attempts = 1 + DEFAULT_HYDE_JSON_RETRIES
+        for attempt in range(1, max_attempts + 1):
+            try:
+                resp = self.llm_client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=self.hyde_temperature,
+                )
+                self._record_usage(resp)
+                data = parse_json_obj(resp.choices[0].message.content or "")
+                docs = data.get("documents") if isinstance(data, dict) else None
+                if not isinstance(docs, list):
+                    print(
+                        "[hybrid][hyde] Invalid JSON/shape "
+                        f"(attempt {attempt}/{max_attempts}); expected {{\"documents\": [...]}}"
+                    )
+                    continue
+                for item in docs:
+                    if not isinstance(item, str):
+                        continue
+                    text = self._clip(item.strip(), self.hyde_max_chars)
+                    if text:
+                        out.append(text)
+                break
+            except Exception as exc:
+                print(f"[hybrid][hyde] LLM call failed (attempt {attempt}/{max_attempts}): {exc}")
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for text in out:
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(text)
+            if len(deduped) >= self.hyde_variants:
+                break
+
+        if deduped:
+            self._hyde_cache[cache_key] = deduped
+        return deduped
 
     def _candidate_text(self, node: dict) -> str:
         return "\n".join(
@@ -151,45 +238,55 @@ class HybridRetriever:
         return out
 
     def _vector_shortlist(self, query: str) -> tuple[dict[str, _NodeEvidence], dict[str, float]]:
-        embedding = self._embed_query(query)
-        result = self.collection.query(
-            query_embeddings=[embedding],
-            n_results=self.vector_top_n,
-            include=["distances"],
-        )
+        query_texts = [query]
+        query_weights = [1.0]
+        for variant in self._hyde_generate_variants(query):
+            query_texts.append(variant)
+            query_weights.append(self.hyde_variant_weight)
 
-        ids_raw = result.get("ids") or [[]]
-        distances_raw = result.get("distances") or [[]]
-        ids = ids_raw[0] if ids_raw else []
-        distances = distances_raw[0] if distances_raw else []
+        embeddings = self._embed_queries(query_texts)
 
         evidence: dict[str, _NodeEvidence] = {}
         file_scores: dict[str, float] = {}
 
-        for idx, (node_id_raw, dist) in enumerate(zip(ids, distances)):
-            node_id = str(node_id_raw)
-            node = self.nodes.get(node_id)
-            if not node:
+        for embedding, weight in zip(embeddings, query_weights):
+            if weight <= 0:
                 continue
-            if node.get("kind") not in {"section", "top", "file"}:
-                continue
+            result = self.collection.query(
+                query_embeddings=[embedding],
+                n_results=self.vector_top_n,
+                include=["distances"],
+            )
 
-            distance = float(dist) if dist is not None else 1.0
-            rank_weight = 1.0 / (idx + 1)
-            closeness = max(0.0, 1.0 - distance)
-            per_hit_score = (0.7 * closeness) + (0.3 * rank_weight)
+            ids_raw = result.get("ids") or [[]]
+            distances_raw = result.get("distances") or [[]]
+            ids = ids_raw[0] if ids_raw else []
+            distances = distances_raw[0] if distances_raw else []
 
-            source = str(node.get("source", ""))
-            if source:
-                file_scores[source] = max(file_scores.get(source, 0.0), per_hit_score)
+            for idx, (node_id_raw, dist) in enumerate(zip(ids, distances)):
+                node_id = str(node_id_raw)
+                node = self.nodes.get(node_id)
+                if not node:
+                    continue
+                if node.get("kind") not in {"section", "top", "file"}:
+                    continue
 
-            e = evidence.setdefault(node_id, _NodeEvidence())
-            e.score += per_hit_score
-            e.hit_count += 1
-            if distance < e.best_distance:
-                e.best_distance = distance
-            if idx < e.best_rank:
-                e.best_rank = idx
+                distance = float(dist) if dist is not None else 1.0
+                rank_weight = 1.0 / (idx + 1)
+                closeness = max(0.0, 1.0 - distance)
+                per_hit_score = ((0.7 * closeness) + (0.3 * rank_weight)) * weight
+
+                source = str(node.get("source", ""))
+                if source:
+                    file_scores[source] = max(file_scores.get(source, 0.0), per_hit_score)
+
+                e = evidence.setdefault(node_id, _NodeEvidence())
+                e.score += per_hit_score
+                e.hit_count += 1
+                if distance < e.best_distance:
+                    e.best_distance = distance
+                if idx < e.best_rank:
+                    e.best_rank = idx
 
         return evidence, file_scores
 
@@ -434,6 +531,10 @@ def main() -> None:
     parser.add_argument("--rrf-k", type=int, default=DEFAULT_RRF_K, help="RRF constant for vector(summary)/tree + BM25 fusion")
     parser.add_argument("--rrf-vector-weight", type=float, default=1.0, help="RRF weight for vector(summary)/tree branch")
     parser.add_argument("--rrf-bm25-weight", type=float, default=1.0, help="RRF weight for BM25 branch")
+    parser.add_argument("--hyde-variants", type=int, default=DEFAULT_HYDE_VARIANTS, help="Number of HyDE query variants for dense retrieval (0 disables)")
+    parser.add_argument("--hyde-variant-weight", type=float, default=DEFAULT_HYDE_VARIANT_WEIGHT, help="Score weight applied to each HyDE variant dense hit")
+    parser.add_argument("--hyde-temperature", type=float, default=DEFAULT_HYDE_TEMPERATURE, help="Temperature for HyDE generation")
+    parser.add_argument("--hyde-max-chars", type=int, default=DEFAULT_HYDE_MAX_CHARS, help="Max chars kept per HyDE synthetic document")
     parser.add_argument("--content-chars", type=int, default=500, help="Max chars to show per result content")
     parser.add_argument("--no-llm", action="store_true", help="Disable hybrid LLM rerank")
     parser.add_argument("query", nargs="*", help="One-shot query")
@@ -463,6 +564,10 @@ def main() -> None:
         rrf_k=args.rrf_k,
         rrf_vector_weight=args.rrf_vector_weight,
         rrf_bm25_weight=args.rrf_bm25_weight,
+        hyde_variants=args.hyde_variants,
+        hyde_variant_weight=args.hyde_variant_weight,
+        hyde_temperature=args.hyde_temperature,
+        hyde_max_chars=args.hyde_max_chars,
     )
 
     if args.query:

@@ -95,3 +95,19 @@ Notes:
 - `pageindex_retrieve.py` and `pageindex_api.py` support `--llm-final-only` to skip tree-step LLM calls and use LLM only for final ranking.
 - In LLM mode, retrieval sends both summary and body excerpts to the model (`--step-text-chars` and `--final-text-chars` tune payload size).
 - Design/implementation plan is stored in `PAGEINDEX_PLAN.md`.
+
+### Hybrid Retrieval (Summary Vectors + BM25 + Tree Expansion)
+
+```bash
+# 1) Build embeddings for PageIndex node summaries
+uv run python hybrid_embed_summaries.py --base-url http://localhost:8059/v1 --reset
+
+# 2) Query hybrid retriever (baseline)
+uv run python hybrid_retrieve.py --no-llm "how to configure symfony routing"
+
+# 3) Query hybrid retriever with HyDE (2 synthetic variants)
+uv run python hybrid_retrieve.py --hyde-variants 2 "how to configure symfony routing"
+
+# 4) Benchmark hybrid with HyDE enabled
+uv run python benchmark_run.py --mode both --predictor hybrid --hybrid-hyde-variants 2
+```

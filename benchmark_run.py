@@ -43,6 +43,10 @@ DEFAULT_HYBRID_VECTOR_TOP_N = 40
 DEFAULT_HYBRID_CANDIDATE_CAP = 30
 DEFAULT_HYBRID_NEIGHBOR_DEPTH = 1
 DEFAULT_HYBRID_SIBLINGS = 2
+DEFAULT_HYBRID_HYDE_VARIANTS = 0
+DEFAULT_HYBRID_HYDE_VARIANT_WEIGHT = 0.7
+DEFAULT_HYBRID_HYDE_TEMPERATURE = 0.3
+DEFAULT_HYBRID_HYDE_MAX_CHARS = 420
 
 QUERY_PREFIX = "Represent this query for searching relevant code: "
 
@@ -303,6 +307,10 @@ class HybridPredictor(Predictor):
         rrf_k: int,
         rrf_vector_weight: float,
         rrf_bm25_weight: float,
+        hyde_variants: int,
+        hyde_variant_weight: float,
+        hyde_temperature: float,
+        hyde_max_chars: int,
     ):
         super().__init__()
         if not nodes_file.is_file():
@@ -327,6 +335,10 @@ class HybridPredictor(Predictor):
             rrf_k=rrf_k,
             rrf_vector_weight=rrf_vector_weight,
             rrf_bm25_weight=rrf_bm25_weight,
+            hyde_variants=hyde_variants,
+            hyde_variant_weight=hyde_variant_weight,
+            hyde_temperature=hyde_temperature,
+            hyde_max_chars=hyde_max_chars,
         )
 
     def predict(self, query: str, top_k: int) -> list[Hit]:
@@ -440,6 +452,10 @@ def main() -> None:
     parser.add_argument("--hybrid-rrf-k", type=int, default=60, help="RRF constant for hybrid vector(summary)/tree + BM25 fusion")
     parser.add_argument("--hybrid-rrf-vector-weight", type=float, default=1.0, help="RRF weight for hybrid vector(summary)/tree branch")
     parser.add_argument("--hybrid-rrf-bm25-weight", type=float, default=1.0, help="RRF weight for hybrid BM25 branch")
+    parser.add_argument("--hybrid-hyde-variants", type=int, default=DEFAULT_HYBRID_HYDE_VARIANTS, help="HyDE variant count for hybrid dense retrieval (0 disables)")
+    parser.add_argument("--hybrid-hyde-variant-weight", type=float, default=DEFAULT_HYBRID_HYDE_VARIANT_WEIGHT, help="Score weight applied to each hybrid HyDE variant")
+    parser.add_argument("--hybrid-hyde-temperature", type=float, default=DEFAULT_HYBRID_HYDE_TEMPERATURE, help="Temperature for hybrid HyDE generation")
+    parser.add_argument("--hybrid-hyde-max-chars", type=int, default=DEFAULT_HYBRID_HYDE_MAX_CHARS, help="Max chars kept per hybrid HyDE synthetic document")
     parser.add_argument("--limit", type=int, default=0, help="Limit number of benchmark questions")
     parser.add_argument("--sample-size", type=int, default=0, help="Randomly sample N questions (0 = all)")
     parser.add_argument("--sample-seed", type=int, default=42, help="Seed for random sampling")
@@ -507,6 +523,10 @@ def main() -> None:
             rrf_k=args.hybrid_rrf_k,
             rrf_vector_weight=args.hybrid_rrf_vector_weight,
             rrf_bm25_weight=args.hybrid_rrf_bm25_weight,
+            hyde_variants=args.hybrid_hyde_variants,
+            hyde_variant_weight=args.hybrid_hyde_variant_weight,
+            hyde_temperature=args.hybrid_hyde_temperature,
+            hyde_max_chars=args.hybrid_hyde_max_chars,
         )
 
     modes = ["strict", "relaxed"] if args.mode == "both" else [args.mode]

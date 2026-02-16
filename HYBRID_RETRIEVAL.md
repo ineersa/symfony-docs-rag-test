@@ -14,8 +14,9 @@ This approach addresses common RAG failure modes where:
 
 The retrieval process follows a multi-stage pipeline:
 
-1.  **Vector Shortlist**:
-    - The query is embedded and searched against the local ChromaDB vector index.
+1.  **Vector Shortlist (with optional HyDE)**:
+    - Optional HyDE generates 2-3 synthetic Symfony-style summaries for the query.
+    - The original query and HyDE variants are embedded and searched against the local ChromaDB vector index.
     - Top `vector_top_n` chunks are retrieved.
     - Chunks are mapped to **PageIndex Nodes** (sections/topics) via line number overlap or breadcrumb matching.
     - Initial scores are assigned based on vector distance and rank.
@@ -98,6 +99,8 @@ The `HybridRetriever` can be tuned via several parameters. Here is how they affe
 | Parameter              | Default | Description                                               | Impact on RAG                                                                                                                                                              |
 | :--------------------- | :------ | :-------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `vector_top_n`         | `40`    | Number of chunks to fetch from ChromaDB.                  | **Recall vs. Noise.** Higher values increase the chance of finding the right "seed" but introduce more irrelevant noise nodes.                                             |
+| `hyde_variants`        | `0`     | Number of synthetic HyDE query-doc variants.              | **Dense Recall Boost.** `0` keeps baseline behavior. `2-3` usually helps when user wording differs from docs phrasing.                                                       |
+| `hyde_variant_weight`  | `0.7`   | Score weight for each HyDE variant dense hit.             | **Stability vs. Diversity.** Lower than `1.0` keeps original query dominant while still using HyDE for recall.                                                               |
 | `neighbor_depth`       | `1`     | Levels of graph traversal (up/down/sideways).             | **Context Discovery.** Setting this >0 allows the system to find "adjacent" answers (e.g., finding the "Configuration" section when the vector hit was on "Installation"). |
 | `siblings_per_node`    | `2`     | Max sibling nodes to include.                             | **Width of Context.** Controls how "wide" the expansion is within a single section.                                                                                        |
 | `candidate_file_roots` | `5`     | Number of whole files to inject based on aggregate score. | **Document Level Recall.** Ensures that if many chunks from a file match, the file's root node is considered, helpful for "Overview of X" queries.                         |
@@ -111,6 +114,13 @@ The `HybridRetriever` can be tuned via several parameters. Here is how they affe
 | `final_summary_chars` | `420`   | Length of node summary sent to LLM.       | **Context Window.** Controls how much "summary" metadata the LLM sees.                                                                                 |
 | `final_text_chars`    | `1500`  | Length of raw text body sent to LLM.      | **Context Window.** Controls how much actual content the LLM reads. Increasing this allows the LLM to judge relevance better but consumes more tokens. |
 
+HyDE generation controls:
+
+| Parameter          | Default | Description                                 | Impact on RAG                                                                                                      |
+| :----------------- | :------ | :------------------------------------------ | :----------------------------------------------------------------------------------------------------------------- |
+| `hyde_temperature` | `0.3`   | Sampling temperature for HyDE generation.   | **Variant Diversity.** Slightly higher values create broader hypotheses; too high can make variants noisy.       |
+| `hyde_max_chars`   | `420`   | Max length of each generated HyDE document. | **Prompt Budget.** Caps synthetic text before embedding to prevent long noisy variants from dominating retrieval. |
+
 ### CLI Usage Example
 
 ```bash
@@ -120,4 +130,10 @@ uv run hybrid_retrieve.py \
   --candidate-cap 50 \
   --final-text-chars 2000 \
   "how to configure security"
+
+# HyDE mode: generate 2 synthetic summaries per query
+uv run hybrid_retrieve.py \
+  --hyde-variants 2 \
+  --hyde-variant-weight 0.7 \
+  "how to configure security firewalls"
 ```
