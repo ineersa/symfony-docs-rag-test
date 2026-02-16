@@ -25,6 +25,8 @@ TREE_FILE = OUTPUT_DIR / "tree.json"
 NODES_FILE = OUTPUT_DIR / "nodes.jsonl"
 DEFAULT_SUMMARY_BASE_URL = "http://localhost:8052/v1"
 DEFAULT_SUMMARY_MODEL = "local-model"
+DEFAULT_SUMMARY_MAX_CHARS = 1700
+DEFAULT_SUMMARY_SHRINK_RETRIES = 3
 
 TOCTREE_RE = re.compile(r"^\.\.\s+toctree::\s*$")
 
@@ -38,19 +40,31 @@ def _clean_text(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
-def _summarize(text: str, max_chars: int = 320) -> str:
+def _summarize(text: str, max_chars: int = DEFAULT_SUMMARY_MAX_CHARS) -> str:
     one_line = re.sub(r"\s+", " ", text).strip()
     if len(one_line) <= max_chars:
         return one_line
     return one_line[: max_chars - 3].rstrip() + "..."
 
 
-def _summary_prompt(text: str) -> str:
+def _summary_prompt(text: str, max_chars: int) -> str:
     return (
         "You are given part of a documentation page. "
         "Write a concise summary of the key points covered in this part.\n\n"
-        f"Partial document text:\n{text}\n\n"
+        f"Document text:\n{text}\n\n"
         "Return only the summary text."
+    )
+
+
+def _shrink_summary_prompt(summary: str, max_chars: int) -> str:
+    return (
+        "Rewrite the summary below to fit a strict length limit while preserving as much detail as possible.\n\n"
+        "Requirements:\n"
+        f"- Output must be <= {max_chars} characters.\n"
+        "- Keep concrete entities and specifics whenever possible.\n"
+        "- Keep it factual; do not invent information.\n"
+        "- Return only the rewritten summary text.\n\n"
+        f"Current summary:\n{summary}"
     )
 
 
@@ -59,21 +73,36 @@ async def _generate_summary(
     *,
     model: str,
     text: str,
-    input_chars: int,
-    output_chars: int,
+    max_chars: int,
+    shrink_retries: int,
 ) -> str:
-    clipped = (text or "")[:input_chars]
-    if not clipped.strip():
+    full_text = (text or "")
+    if not full_text.strip():
         return ""
     resp = await client.chat.completions.create(
         model=model,
-        messages=[{"role": "user", "content": _summary_prompt(clipped)}],
+        messages=[{"role": "user", "content": _summary_prompt(full_text, max_chars)}],
         temperature=0,
     )
-    content = (resp.choices[0].message.content or "").strip()
+    content = re.sub(r"\s+", " ", (resp.choices[0].message.content or "")).strip()
     if not content:
         return ""
-    return _summarize(content, max_chars=output_chars)
+
+    attempts = 0
+    while len(content) > max_chars and attempts < max(0, shrink_retries):
+        attempts += 1
+        shrink_resp = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": _shrink_summary_prompt(content, max_chars)}],
+            temperature=0,
+        )
+        content = re.sub(r"\s+", " ", (shrink_resp.choices[0].message.content or "")).strip()
+        if not content:
+            return ""
+
+    if len(content) > max_chars:
+        return ""
+    return content
 
 
 async def enrich_summaries_with_llm(
@@ -82,8 +111,8 @@ async def enrich_summaries_with_llm(
     base_url: str,
     model: str,
     concurrency: int,
-    input_chars: int,
-    output_chars: int,
+    max_chars: int,
+    shrink_retries: int,
     progress: Progress | None = None,
     task_id: TaskID | None = None,
 ) -> int:
@@ -95,18 +124,22 @@ async def enrich_summaries_with_llm(
     ]
 
     async def worker(row: dict) -> None:
+        fallback_summary = _summarize(str(row.get("summary") or ""), max_chars=max_chars)
         try:
             async with semaphore:
                 summary = await _generate_summary(
                     client,
                     model=model,
                     text=row.get("text") or "",
-                    input_chars=input_chars,
-                    output_chars=output_chars,
+                    max_chars=max_chars,
+                    shrink_retries=shrink_retries,
                 )
             if summary:
                 row["summary"] = summary
+            else:
+                row["summary"] = fallback_summary
         except Exception:
+            row["summary"] = fallback_summary
             return
 
     tasks = [asyncio.create_task(worker(row)) for row in targets]
@@ -355,8 +388,18 @@ def main() -> None:
     parser.add_argument("--summary-base-url", default=DEFAULT_SUMMARY_BASE_URL, help="OpenAI-compatible base URL for summaries")
     parser.add_argument("--summary-model", default=DEFAULT_SUMMARY_MODEL, help="Model name for LLM summaries")
     parser.add_argument("--summary-concurrency", type=int, default=8, help="Concurrent summary requests in LLM mode")
-    parser.add_argument("--summary-input-chars", type=int, default=3200, help="Input text chars sent per summary request")
-    parser.add_argument("--summary-output-chars", type=int, default=420, help="Max stored summary chars")
+    parser.add_argument(
+        "--summary-max-chars",
+        type=int,
+        default=DEFAULT_SUMMARY_MAX_CHARS,
+        help="Strict max characters for each LLM summary",
+    )
+    parser.add_argument(
+        "--summary-shrink-retries",
+        type=int,
+        default=DEFAULT_SUMMARY_SHRINK_RETRIES,
+        help="Extra rewrite attempts when LLM summary exceeds --summary-max-chars",
+    )
     args = parser.parse_args()
 
     docs_root = args.docs_dir.resolve()
@@ -406,8 +449,8 @@ def main() -> None:
                     base_url=args.summary_base_url,
                     model=args.summary_model,
                     concurrency=args.summary_concurrency,
-                    input_chars=args.summary_input_chars,
-                    output_chars=args.summary_output_chars,
+                    max_chars=args.summary_max_chars,
+                    shrink_retries=args.summary_shrink_retries,
                     progress=progress,
                     task_id=summary_task,
                 )

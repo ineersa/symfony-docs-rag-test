@@ -224,15 +224,7 @@ class HybridRetriever:
         return deduped
 
     def _candidate_text(self, node: dict) -> str:
-        return "\n".join(
-            [
-                node.get("source") or "",
-                node.get("title") or "",
-                node.get("breadcrumb") or "",
-                node.get("summary") or "",
-                (node.get("text") or "")[:1500],
-            ]
-        ).strip()
+        return str(node.get("text") or "").strip()
 
     def _node_bm25_text(self, node: dict[str, Any]) -> str:
         return "\n".join(
@@ -374,14 +366,6 @@ class HybridRetriever:
         self._usage["total_tokens"] += int(getattr(usage, "total_tokens", 0) or 0)
 
     def _candidate_passages(self, candidate: dict) -> list[str]:
-        header = "\n".join(
-            [
-                str(candidate.get("source") or ""),
-                str(candidate.get("title") or ""),
-                str(candidate.get("breadcrumb") or ""),
-                str(candidate.get("summary") or ""),
-            ]
-        ).strip()
         text = str(candidate.get("text") or "")
         chunks = split_text_for_rerank(
             text,
@@ -389,13 +373,8 @@ class HybridRetriever:
             overlap_chars=self.rerank_chunk_overlap,
         )
         if not chunks:
-            return [header] if header else []
-        out: list[str] = []
-        for chunk in chunks:
-            passage = "\n".join([header, chunk]).strip() if header else chunk
-            if passage:
-                out.append(passage)
-        return out
+            return [text] if text.strip() else []
+        return [chunk for chunk in chunks if chunk.strip()]
 
     def _rerank_candidates(self, query: str, candidates: list[dict]) -> dict[str, float]:
         if not self.reranker or not candidates:
