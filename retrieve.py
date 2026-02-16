@@ -8,6 +8,7 @@ displays top-K results with citations.
 import argparse
 import sys
 from pathlib import Path
+from typing import Any, Sequence
 
 import chromadb
 from openai import OpenAI
@@ -18,6 +19,21 @@ from rich.table import Table
 from rich import box
 
 from bm25_common import BM25Index, reciprocal_rank_fusion
+from hyde_common import (
+    DEFAULT_HYDE_BASE_URL,
+    DEFAULT_HYDE_MAX_CHARS,
+    DEFAULT_HYDE_MODEL,
+    DEFAULT_HYDE_TEMPERATURE,
+    DEFAULT_HYDE_VARIANT_WEIGHT,
+    DEFAULT_HYDE_VARIANTS,
+    HyDEGenerator,
+)
+from rerank_common import (
+    BGEReranker,
+    DEFAULT_RERANKER_DEVICE,
+    DEFAULT_RERANKER_MODEL,
+    build_rerank_passage,
+)
 
 # ── Defaults ───────────────────────────────────────────────────────
 DEFAULT_BASE_URL = "http://localhost:8059/v1"
@@ -26,22 +42,33 @@ DEFAULT_TOP_K = 5
 DEFAULT_VECTOR_CANDIDATES = 40
 DEFAULT_BM25_CANDIDATES = 40
 DEFAULT_RRF_K = 60
+DEFAULT_RERANK_CANDIDATES = 25
+DEFAULT_HYDE_WEIGHT = DEFAULT_HYDE_VARIANT_WEIGHT
 CHROMA_DIR = Path("data/chroma")
 
 # CodeRankEmbed bi-encoder: queries need this prefix
 QUERY_PREFIX = "Represent this query for searching relevant code: "
 
 
-def embed_query(client: OpenAI, query: str, model: str = "CodeRankEmbed") -> list[float]:
-    """Embed a query with the required task prefix."""
-    # Add Symfony context if not mentioned
+def _enrich_query(query: str) -> str:
     enriched = query
     if "symfony" not in query.lower():
         enriched = f"{query} (Symfony PHP framework)"
+    return enriched
 
-    prefixed = f"{QUERY_PREFIX}{enriched}"
-    response = client.embeddings.create(input=[prefixed], model=model)
-    return response.data[0].embedding
+
+def embed_queries(client: OpenAI, queries: list[str], model: str = "CodeRankEmbed") -> list[list[float]]:
+    """Embed queries with the required task prefix."""
+    if not queries:
+        return []
+    prefixed = [f"{QUERY_PREFIX}{_enrich_query(q)}" for q in queries]
+    response = client.embeddings.create(input=prefixed, model=model)
+    return [item.embedding for item in response.data]
+
+
+def embed_query(client: OpenAI, query: str, model: str = "CodeRankEmbed") -> list[float]:
+    embeddings = embed_queries(client, [query], model=model)
+    return embeddings[0]
 
 
 def display_results(console: Console, query: str, results: dict, top_k: int):
@@ -94,6 +121,96 @@ def display_results(console: Console, query: str, results: dict, top_k: int):
     console.print(f"[dim]Showing {len(ids)}/{top_k} results[/]")
 
 
+def retrieve_with_fusion_and_rerank(
+    *,
+    collection,
+    bm25_index: BM25Index,
+    id_to_row: dict[str, int],
+    corpus_ids: list[str],
+    corpus_docs: list[str],
+    corpus_metas: Sequence[Any],
+    query_embeddings: list[list[float]],
+    vector_weights: list[float],
+    query: str,
+    top_k: int,
+    vector_candidates: int,
+    bm25_candidates: int,
+    rrf_k: int,
+    reranker: BGEReranker | None,
+    rerank_candidates: int,
+) -> dict:
+    if not query_embeddings:
+        return {"ids": [[]], "documents": [[]], "metadatas": [[]], "distances": [[]]}
+
+    branch_ids: list[list[str]] = []
+    branch_weights: list[float] = []
+    vector_by_id: dict[str, tuple[str, dict, float]] = {}
+    for embedding, weight in zip(query_embeddings, vector_weights):
+        if weight <= 0:
+            continue
+        vector_results = collection.query(
+            query_embeddings=[embedding],
+            n_results=max(top_k, vector_candidates),
+            include=["documents", "metadatas", "distances"],
+        )
+        ids_raw = vector_results.get("ids") or [[]]
+        docs_raw = vector_results.get("documents") or [[]]
+        metas_raw = vector_results.get("metadatas") or [[]]
+        dists_raw = vector_results.get("distances") or [[]]
+        vector_ids = [str(x) for x in (ids_raw[0] if ids_raw else [])]
+        vector_docs = docs_raw[0] if docs_raw else []
+        vector_metas = metas_raw[0] if metas_raw else []
+        vector_distances = dists_raw[0] if dists_raw else []
+
+        branch_ids.append(vector_ids)
+        branch_weights.append(float(weight))
+        for doc_id, doc, meta, dist in zip(vector_ids, vector_docs, vector_metas, vector_distances):
+            dist_val = float(dist) if dist is not None else 1.0
+            if doc_id not in vector_by_id or dist_val < vector_by_id[doc_id][2]:
+                vector_by_id[doc_id] = (str(doc or ""), dict(meta or {}), dist_val)
+
+    bm25_hits = bm25_index.search(query, bm25_candidates)
+    bm25_ids = [corpus_ids[h.index] for h in bm25_hits if 0 <= h.index < len(corpus_ids)]
+
+    fused = reciprocal_rank_fusion(branch_ids + [bm25_ids], rrf_k=rrf_k, weights=branch_weights + [1.0])
+    candidate_cap = max(top_k, rerank_candidates) if reranker else top_k
+    candidate_ids = [doc_id for doc_id, _ in fused[:candidate_cap]]
+
+    candidates: list[dict] = []
+    for doc_id in candidate_ids:
+        if doc_id in vector_by_id:
+            doc, meta, dist = vector_by_id[doc_id]
+        else:
+            idx = id_to_row[doc_id]
+            meta = dict(corpus_metas[idx] or {})
+            doc = str(corpus_docs[idx] or "")
+            dist = 0.99
+        candidates.append(
+            {
+                "id": doc_id,
+                "doc": doc,
+                "meta": meta,
+                "distance": dist,
+            }
+        )
+
+    if reranker and candidates:
+        passages = [build_rerank_passage(c["meta"], c["doc"]) for c in candidates]
+        scores = reranker.score(query, passages)
+        for c, score in zip(candidates, scores):
+            c["rerank_score"] = score
+            c["distance"] = 1.0 - score
+        candidates.sort(key=lambda c: float(c.get("rerank_score", 0.0)), reverse=True)
+
+    final = candidates[:top_k]
+    return {
+        "ids": [[str(c["id"]) for c in final]],
+        "documents": [[str(c["doc"]) for c in final]],
+        "metadatas": [[dict(c["meta"]) for c in final]],
+        "distances": [[float(c["distance"]) for c in final]],
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Retrieve Symfony docs by similarity")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Embeddings API base URL")
@@ -102,6 +219,17 @@ def main():
     parser.add_argument("--vector-candidates", type=int, default=DEFAULT_VECTOR_CANDIDATES, help="Vector shortlist size before RRF")
     parser.add_argument("--bm25-candidates", type=int, default=DEFAULT_BM25_CANDIDATES, help="BM25 shortlist size before RRF")
     parser.add_argument("--rrf-k", type=int, default=DEFAULT_RRF_K, help="RRF constant")
+    parser.add_argument("--no-rerank", action="store_true", help="Disable BGE reranking")
+    parser.add_argument("--reranker-model", default=DEFAULT_RERANKER_MODEL, help="BGE reranker model")
+    parser.add_argument("--reranker-device", default=DEFAULT_RERANKER_DEVICE, help="Reranker device, e.g. cpu or cuda:0")
+    parser.add_argument("--reranker-fp16", action="store_true", help="Use FP16 for reranker (GPU only)")
+    parser.add_argument("--rerank-candidates", type=int, default=DEFAULT_RERANK_CANDIDATES, help="RRF candidates passed to reranker")
+    parser.add_argument("--hyde-variants", type=int, default=DEFAULT_HYDE_VARIANTS, help="HyDE variant count for dense retrieval (0 disables)")
+    parser.add_argument("--hyde-variant-weight", type=float, default=DEFAULT_HYDE_WEIGHT, help="RRF weight applied to each HyDE vector branch")
+    parser.add_argument("--hyde-base-url", default=DEFAULT_HYDE_BASE_URL, help="HyDE LLM API URL")
+    parser.add_argument("--hyde-model", default=DEFAULT_HYDE_MODEL, help="HyDE LLM model name")
+    parser.add_argument("--hyde-temperature", type=float, default=DEFAULT_HYDE_TEMPERATURE, help="HyDE generation temperature")
+    parser.add_argument("--hyde-max-chars", type=int, default=DEFAULT_HYDE_MAX_CHARS, help="Max chars kept per HyDE synthetic chunk")
     parser.add_argument("--chroma-dir", type=Path, default=CHROMA_DIR, help="ChromaDB storage directory")
     parser.add_argument("query", nargs="*", help="One-shot query (skip REPL)")
     args = parser.parse_args()
@@ -143,59 +271,64 @@ def main():
         )
     bm25_index = BM25Index(bm25_texts)
 
+    reranker: BGEReranker | None = None
+    if not args.no_rerank:
+        console.print(
+            f"[bold]Loading reranker[/] {args.reranker_model} "
+            f"([dim]{args.reranker_device}[/])"
+        )
+        reranker = BGEReranker(
+            args.reranker_model,
+            device=args.reranker_device,
+            use_fp16=args.reranker_fp16,
+            normalize=True,
+        )
+
+    hyde: HyDEGenerator | None = None
+    hyde_variant_weight = max(0.0, float(args.hyde_variant_weight))
+    if args.hyde_variants > 0:
+        console.print(
+            f"[bold]Loading HyDE[/] {args.hyde_model} "
+            f"([dim]{args.hyde_base_url}[/])"
+        )
+        hyde = HyDEGenerator(
+            base_url=args.hyde_base_url,
+            model=args.hyde_model,
+            variants=args.hyde_variants,
+            temperature=args.hyde_temperature,
+            max_chars=args.hyde_max_chars,
+        )
+
     # Setup embeddings client
     client = OpenAI(base_url=args.base_url, api_key="not-needed")
 
     # One-shot mode
     if args.query:
         query = " ".join(args.query)
-        query_embedding = embed_query(client, query)
-        vector_results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=max(args.top_k, args.vector_candidates),
-            include=["documents", "metadatas", "distances"],
+        query_texts = [query]
+        query_weights = [1.0]
+        if hyde:
+            for variant in hyde.generate(query):
+                query_texts.append(variant)
+                query_weights.append(hyde_variant_weight)
+        query_embeddings = embed_queries(client, query_texts)
+        results = retrieve_with_fusion_and_rerank(
+            collection=collection,
+            bm25_index=bm25_index,
+            id_to_row=id_to_row,
+            corpus_ids=corpus_ids,
+            corpus_docs=corpus_docs,
+            corpus_metas=corpus_metas,
+            query_embeddings=query_embeddings,
+            vector_weights=query_weights,
+            query=query,
+            top_k=args.top_k,
+            vector_candidates=args.vector_candidates,
+            bm25_candidates=args.bm25_candidates,
+            rrf_k=args.rrf_k,
+            reranker=reranker,
+            rerank_candidates=args.rerank_candidates,
         )
-        ids_raw = vector_results.get("ids") or [[]]
-        docs_raw = vector_results.get("documents") or [[]]
-        metas_raw = vector_results.get("metadatas") or [[]]
-        dists_raw = vector_results.get("distances") or [[]]
-        vector_ids = [str(x) for x in (ids_raw[0] if ids_raw else [])]
-        vector_docs = docs_raw[0] if docs_raw else []
-        vector_metas = metas_raw[0] if metas_raw else []
-        vector_distances = dists_raw[0] if dists_raw else []
-
-        vector_by_id: dict[str, tuple[str, dict, float]] = {}
-        for doc_id, doc, meta, dist in zip(vector_ids, vector_docs, vector_metas, vector_distances):
-            vector_by_id[doc_id] = (str(doc or ""), dict(meta or {}), float(dist) if dist is not None else 1.0)
-
-        bm25_hits = bm25_index.search(query, args.bm25_candidates)
-        bm25_ids = [corpus_ids[h.index] for h in bm25_hits if 0 <= h.index < len(corpus_ids)]
-
-        fused = reciprocal_rank_fusion([vector_ids, bm25_ids], rrf_k=args.rrf_k)
-        top_ids = [doc_id for doc_id, _ in fused[: args.top_k]]
-
-        out_docs: list[str] = []
-        out_metas: list[dict] = []
-        out_distances: list[float] = []
-        for doc_id in top_ids:
-            if doc_id in vector_by_id:
-                doc, meta, dist = vector_by_id[doc_id]
-                out_docs.append(doc)
-                out_metas.append(meta)
-                out_distances.append(dist)
-                continue
-            idx = id_to_row[doc_id]
-            meta = dict(corpus_metas[idx] or {})
-            out_docs.append(str(corpus_docs[idx] or ""))
-            out_metas.append(meta)
-            out_distances.append(0.99)
-
-        results = {
-            "ids": [top_ids],
-            "documents": [out_docs],
-            "metadatas": [out_metas],
-            "distances": [out_distances],
-        }
         display_results(console, query, results, args.top_k)
         return
 
@@ -236,52 +369,30 @@ def main():
 
         # Query
         try:
-            query_embedding = embed_query(client, query)
-            vector_results = collection.query(
-                query_embeddings=[query_embedding],
-                n_results=max(top_k, args.vector_candidates),
-                include=["documents", "metadatas", "distances"],
+            query_texts = [query]
+            query_weights = [1.0]
+            if hyde:
+                for variant in hyde.generate(query):
+                    query_texts.append(variant)
+                    query_weights.append(hyde_variant_weight)
+            query_embeddings = embed_queries(client, query_texts)
+            results = retrieve_with_fusion_and_rerank(
+                collection=collection,
+                bm25_index=bm25_index,
+                id_to_row=id_to_row,
+                corpus_ids=corpus_ids,
+                corpus_docs=corpus_docs,
+                corpus_metas=corpus_metas,
+                query_embeddings=query_embeddings,
+                vector_weights=query_weights,
+                query=query,
+                top_k=top_k,
+                vector_candidates=args.vector_candidates,
+                bm25_candidates=args.bm25_candidates,
+                rrf_k=args.rrf_k,
+                reranker=reranker,
+                rerank_candidates=args.rerank_candidates,
             )
-            ids_raw = vector_results.get("ids") or [[]]
-            docs_raw = vector_results.get("documents") or [[]]
-            metas_raw = vector_results.get("metadatas") or [[]]
-            dists_raw = vector_results.get("distances") or [[]]
-            vector_ids = [str(x) for x in (ids_raw[0] if ids_raw else [])]
-            vector_docs = docs_raw[0] if docs_raw else []
-            vector_metas = metas_raw[0] if metas_raw else []
-            vector_distances = dists_raw[0] if dists_raw else []
-
-            vector_by_id: dict[str, tuple[str, dict, float]] = {}
-            for doc_id, doc, meta, dist in zip(vector_ids, vector_docs, vector_metas, vector_distances):
-                vector_by_id[doc_id] = (str(doc or ""), dict(meta or {}), float(dist) if dist is not None else 1.0)
-
-            bm25_hits = bm25_index.search(query, args.bm25_candidates)
-            bm25_ids = [corpus_ids[h.index] for h in bm25_hits if 0 <= h.index < len(corpus_ids)]
-
-            fused = reciprocal_rank_fusion([vector_ids, bm25_ids], rrf_k=args.rrf_k)
-            top_ids = [doc_id for doc_id, _ in fused[:top_k]]
-
-            out_docs: list[str] = []
-            out_metas: list[dict] = []
-            out_distances: list[float] = []
-            for doc_id in top_ids:
-                if doc_id in vector_by_id:
-                    doc, meta, dist = vector_by_id[doc_id]
-                    out_docs.append(doc)
-                    out_metas.append(meta)
-                    out_distances.append(dist)
-                    continue
-                idx = id_to_row[doc_id]
-                out_docs.append(str(corpus_docs[idx] or ""))
-                out_metas.append(dict(corpus_metas[idx] or {}))
-                out_distances.append(0.99)
-
-            results = {
-                "ids": [top_ids],
-                "documents": [out_docs],
-                "metadatas": [out_metas],
-                "distances": [out_distances],
-            }
             display_results(console, query, results, top_k)
         except Exception as e:
             console.print(f"[red]Error:[/] {e}")

@@ -19,7 +19,7 @@ pageindex_api.py      — HTTP API for tree retrieval (benchmark-compatible)
 
 benchmark_build.py   — Builds benchmark questions with gold file+line spans
 benchmark_run.py     — Runs strict/relaxed hit@1 and hit@5 benchmark
-hybrid_retrieve.py   — Hybrid retriever (vector shortlist + tree expansion + LLM rerank)
+hybrid_retrieve.py   — Hybrid retriever (vector shortlist + tree expansion + BGE rerank)
 
 symfony-docs/       — Symfony documentation source (RST files)
 data/               — Generated artifacts (vector + tree outputs)
@@ -80,12 +80,8 @@ uv run python benchmark_run.py --mode both --predictor pageindex --pageindex-bas
 # run benchmark against local Hybrid predictor (vector + PageIndex rerank)
 uv run python benchmark_run.py --mode both --predictor hybrid --hybrid-base-url http://localhost:8059/v1 --hybrid-model local-model
 
-# hybrid ablation: disable final LLM rerank
-uv run python benchmark_run.py --mode both --predictor hybrid --hybrid-no-llm
-
-# Note: Hybrid predictor now reuses --pageindex-final-summary-chars (default: 420)
-# and --pageindex-final-text-chars (default: 1500) for its LLM reranking step.
-# This allows configurable context windows for the reranker.
+# hybrid ablation: disable final BGE rerank
+uv run python benchmark_run.py --mode both --predictor hybrid --hybrid-no-rerank
 
 # run benchmark against PageIndex API predictor
 uv run python pageindex_api.py --base-url http://localhost:8052/v1 --model local-model --port 8090

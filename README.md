@@ -21,8 +21,14 @@ uv run python embed.py --base-url http://localhost:8059/v1 --reset
 ### Retrieve Manually
 
 ```bash
-# Uses dense vector + BM25 with RRF fusion
+# Uses dense vector + BM25 with RRF fusion, then BGE reranking
 uv run python retrieve.py --base-url http://localhost:8059/v1
+
+# Disable reranking for A/B comparison
+uv run python retrieve.py --no-rerank --base-url http://localhost:8059/v1
+
+# Enable HyDE (2 synthetic query variants)
+uv run python retrieve.py --hyde-variants 2 --hyde-base-url http://localhost:4321/v1 --hyde-model local-model
 ```
 
 ### Build Benchmark Questions
@@ -45,12 +51,24 @@ Output: `data/benchmark/questions.jsonl`
 ### Run Benchmark
 
 ```bash
-# Run both strict and relaxed scoring (local predictor now uses vector+BM25+RRF)
+# Run both strict and relaxed scoring (local predictor uses vector+BM25+RRF+BGE rerank)
 uv run python benchmark_run.py --mode both --base-url http://localhost:8059/v1
 
 # Faster iteration: run on a random subset (e.g. 200 questions)
 uv run python benchmark_run.py --mode both --base-url http://localhost:8059/v1 --sample-size 200 --sample-seed 42
+
+# Disable reranking for local predictor
+uv run python benchmark_run.py --mode both --base-url http://localhost:8059/v1 --local-no-rerank
+
+# Enable HyDE for local simple predictor
+uv run python benchmark_run.py --predictor local --mode both --local-hyde-variants 2 --local-hyde-base-url http://localhost:4321/v1 --local-hyde-model local-model
 ```
+
+Notes:
+- Default reranker model is `BAAI/bge-reranker-base`.
+- First reranked run downloads model weights from Hugging Face.
+- Override with `--reranker-model` in `retrieve.py` and `--local-reranker-model` in `benchmark_run.py`.
+- HyDE is disabled by default (`--hyde-variants 0`, `--local-hyde-variants 0`).
 
 Scoring modes:
 - `strict`: source file matches and chunk line range overlaps gold line range

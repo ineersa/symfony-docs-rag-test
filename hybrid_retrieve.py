@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Hybrid retrieval: summary-vector + tree expansion + BM25 + optional LLM reranking."""
+"""Hybrid retrieval: summary-vector + tree expansion + BM25 + optional BGE reranking."""
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -15,6 +14,14 @@ from rich.panel import Panel
 
 from bm25_common import BM25Index, reciprocal_rank_fusion
 from pageindex_common import QUERY_PREFIX, RetrievedHit, load_nodes, parse_json_obj
+from rerank_common import (
+    BGEReranker,
+    DEFAULT_RERANK_CHUNK_CHARS,
+    DEFAULT_RERANK_CHUNK_OVERLAP,
+    DEFAULT_RERANKER_DEVICE,
+    DEFAULT_RERANKER_MODEL,
+    split_text_for_rerank,
+)
 
 
 DEFAULT_CHROMA_DIR = Path("data/chroma")
@@ -26,6 +33,8 @@ DEFAULT_LLM_BASE_URL = "http://localhost:4321/v1"
 DEFAULT_MODEL = "local-model"
 DEFAULT_BM25_TOP_N = 80
 DEFAULT_RRF_K = 60
+DEFAULT_CANDIDATE_FILE_ROOTS = 5
+DEFAULT_FINAL_CHAR_BUDGET = 35_000
 DEFAULT_HYDE_VARIANTS = 0
 DEFAULT_HYDE_VARIANT_WEIGHT = 0.7
 DEFAULT_HYDE_TEMPERATURE = 0.3
@@ -52,14 +61,19 @@ class HybridRetriever:
         llm_base_url: str | None = None,
         chroma_dir: Path = DEFAULT_CHROMA_DIR,
         collection: str = DEFAULT_COLLECTION,
-        use_llm: bool = True,
+        use_reranker: bool = True,
+        reranker_model: str = DEFAULT_RERANKER_MODEL,
+        reranker_device: str = DEFAULT_RERANKER_DEVICE,
+        reranker_fp16: bool = False,
+        rerank_chunk_chars: int = DEFAULT_RERANK_CHUNK_CHARS,
+        rerank_chunk_overlap: int = DEFAULT_RERANK_CHUNK_OVERLAP,
         vector_top_n: int = 40,
         candidate_cap: int = 30,
         neighbor_depth: int = 1,
         siblings_per_node: int = 2,
-        candidate_file_roots: int = 5,
-        summary_chars: int = 420,
-        text_chars: int = 1500,
+        candidate_file_roots: int = DEFAULT_CANDIDATE_FILE_ROOTS,
+        enable_expansion: bool = True,
+        final_char_budget: int = DEFAULT_FINAL_CHAR_BUDGET,
         bm25_top_n: int = DEFAULT_BM25_TOP_N,
         rrf_k: int = DEFAULT_RRF_K,
         rrf_vector_weight: float = 1.0,
@@ -71,14 +85,14 @@ class HybridRetriever:
     ):
         self.nodes = nodes
         self.model = model
-        self.use_llm = use_llm
+        self.use_reranker = bool(use_reranker)
         self.vector_top_n = vector_top_n
         self.candidate_cap = candidate_cap
         self.neighbor_depth = neighbor_depth
         self.siblings_per_node = siblings_per_node
         self.candidate_file_roots = candidate_file_roots
-        self.summary_chars = summary_chars
-        self.text_chars = text_chars
+        self.enable_expansion = bool(enable_expansion)
+        self.final_char_budget = max(1_000, final_char_budget)
         self.bm25_top_n = max(1, bm25_top_n)
         self.rrf_k = max(1, rrf_k)
         self.rrf_vector_weight = max(0.0, rrf_vector_weight)
@@ -87,11 +101,23 @@ class HybridRetriever:
         self.hyde_variant_weight = max(0.0, hyde_variant_weight)
         self.hyde_temperature = max(0.0, min(1.0, hyde_temperature))
         self.hyde_max_chars = max(80, hyde_max_chars)
+        self.rerank_chunk_chars = max(64, int(rerank_chunk_chars))
+        self.rerank_chunk_overlap = max(0, min(int(rerank_chunk_overlap), self.rerank_chunk_chars - 1))
         embed_url = embed_base_url or base_url
         llm_url = llm_base_url or base_url
         self.embedding_client = OpenAI(base_url=embed_url, api_key="not-needed")
-        self.llm_client = OpenAI(base_url=llm_url, api_key="not-needed") if (use_llm or self.hyde_variants > 0) else None
-        self._llm_cache: dict[str, list[str]] = {}
+        self.llm_client = OpenAI(base_url=llm_url, api_key="not-needed") if self.hyde_variants > 0 else None
+        self.reranker = (
+            BGEReranker(
+                reranker_model,
+                device=reranker_device,
+                use_fp16=reranker_fp16,
+                normalize=True,
+            )
+            if self.use_reranker
+            else None
+        )
+        self._rerank_cache: dict[str, dict[str, float]] = {}
         self._hyde_cache: dict[str, list[str]] = {}
         self._usage = {"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
@@ -291,6 +317,9 @@ class HybridRetriever:
         return evidence, file_scores
 
     def _expand_neighbors(self, seed_scores: dict[str, float], file_scores: dict[str, float]) -> dict[str, float]:
+        if not self.enable_expansion:
+            return dict(seed_scores)
+
         out = dict(seed_scores)
         frontier = list(seed_scores.keys())
         for _ in range(max(0, self.neighbor_depth)):
@@ -344,52 +373,80 @@ class HybridRetriever:
         self._usage["completion_tokens"] += int(getattr(usage, "completion_tokens", 0) or 0)
         self._usage["total_tokens"] += int(getattr(usage, "total_tokens", 0) or 0)
 
-    def _llm_rank(self, query: str, candidates: list[dict], top_k: int) -> list[str]:
-        if not self.llm_client or not candidates:
-            return []
-
-        payload = [
-            {
-                "id": c["id"],
-                "source": c.get("source"),
-                "title": c.get("title"),
-                "breadcrumb": c.get("breadcrumb"),
-                "summary": (c.get("summary") or "")[: self.summary_chars],
-                "text_excerpt": (c.get("text") or "")[: self.text_chars],
-            }
-            for c in candidates
-        ]
-        cache_key = "hybrid|" + query + "|" + "|".join(c["id"] for c in candidates) + f"|{top_k}"
-        if cache_key in self._llm_cache:
-            return self._llm_cache[cache_key]
-
-        prompt = (
-            "You are ranking documentation nodes for a retrieval query. "
-            "Pick nodes that most directly answer the question. "
-            "Prefer concrete how-to sections over high-level overview pages. "
-            "Return ONLY JSON: {\"ids\": [..]} in best-first order.\n\n"
-            f"Query: {query}\n"
-            f"Top K: {top_k}\n"
-            f"Candidates: {json.dumps(payload, ensure_ascii=False)}"
+    def _candidate_passages(self, candidate: dict) -> list[str]:
+        header = "\n".join(
+            [
+                str(candidate.get("source") or ""),
+                str(candidate.get("title") or ""),
+                str(candidate.get("breadcrumb") or ""),
+                str(candidate.get("summary") or ""),
+            ]
+        ).strip()
+        text = str(candidate.get("text") or "")
+        chunks = split_text_for_rerank(
+            text,
+            chunk_chars=self.rerank_chunk_chars,
+            overlap_chars=self.rerank_chunk_overlap,
         )
+        if not chunks:
+            return [header] if header else []
+        out: list[str] = []
+        for chunk in chunks:
+            passage = "\n".join([header, chunk]).strip() if header else chunk
+            if passage:
+                out.append(passage)
+        return out
 
-        try:
-            resp = self.llm_client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-            )
-            self._record_usage(resp)
-            data = parse_json_obj(resp.choices[0].message.content or "")
-            ids = data.get("ids") if isinstance(data, dict) else None
-            if isinstance(ids, list):
-                allowed = {c["id"] for c in candidates}
-                ranked = [str(x) for x in ids if str(x) in allowed][:top_k]
-                self._llm_cache[cache_key] = ranked
-                return ranked
-        except Exception:
-            return []
-        return []
+    def _rerank_candidates(self, query: str, candidates: list[dict]) -> dict[str, float]:
+        if not self.reranker or not candidates:
+            return {}
+
+        rerank_queries = [query]
+        if self.hyde_variants > 0:
+            rerank_queries.extend(self._hyde_generate_variants(query))
+        seen_queries: set[str] = set()
+        deduped_rerank_queries: list[str] = []
+        for q in rerank_queries:
+            key = q.strip().lower()
+            if not key or key in seen_queries:
+                continue
+            seen_queries.add(key)
+            deduped_rerank_queries.append(q)
+        if not deduped_rerank_queries:
+            deduped_rerank_queries = [query]
+
+        candidate_ids = [str(c.get("id", "")) for c in candidates]
+        cache_key = (
+            "rerank|"
+            + "|".join(deduped_rerank_queries)
+            + "|"
+            + "|".join(candidate_ids)
+            + f"|{self.rerank_chunk_chars}|{self.rerank_chunk_overlap}"
+        )
+        if cache_key in self._rerank_cache:
+            return dict(self._rerank_cache[cache_key])
+
+        passages: list[str] = []
+        passage_owner_ids: list[str] = []
+        for candidate in candidates:
+            owner_id = str(candidate.get("id", ""))
+            for passage in self._candidate_passages(candidate):
+                passages.append(passage)
+                passage_owner_ids.append(owner_id)
+
+        if not passages:
+            return {}
+
+        by_id: dict[str, float] = {}
+        for rerank_query in deduped_rerank_queries:
+            scores = self.reranker.score(rerank_query, passages)
+            for owner_id, score in zip(passage_owner_ids, scores):
+                prev = by_id.get(owner_id)
+                if prev is None or float(score) > prev:
+                    by_id[owner_id] = float(score)
+
+        self._rerank_cache[cache_key] = dict(by_id)
+        return by_id
 
     def retrieve(self, query: str, *, top_k: int = 5) -> list[RetrievedHit]:
         evidence, file_scores = self._vector_shortlist(query)
@@ -439,11 +496,20 @@ class HybridRetriever:
         candidate_ids = [nid for nid, _ in fused if nid in nodes_pool][: self.candidate_cap]
         candidates = [nodes_pool[nid] for nid in candidate_ids]
 
-        llm_ids = self._llm_rank(query, candidates, top_k) if self.use_llm else []
+        rerank_scores = self._rerank_candidates(query, candidates) if self.use_reranker else {}
+        reranked_ids: list[str] = []
+        if rerank_scores:
+            candidate_pos = {str(n.get("id", "")): idx for idx, n in enumerate(candidates)}
+            reranked_ids = sorted(
+                [str(n.get("id", "")) for n in candidates],
+                key=lambda nid: (rerank_scores.get(nid, -1.0), -candidate_pos.get(nid, 0)),
+                reverse=True,
+            )
+
         final_nodes: list[dict]
-        if llm_ids:
+        if reranked_ids:
             by_id = {n["id"]: n for n in candidates}
-            final_nodes = [by_id[nid] for nid in llm_ids if nid in by_id]
+            final_nodes = [by_id[nid] for nid in reranked_ids if nid in by_id]
             if len(final_nodes) < top_k:
                 picked = {n["id"] for n in final_nodes}
                 for n in candidates:
@@ -457,12 +523,13 @@ class HybridRetriever:
 
         hits: list[RetrievedHit] = []
         max_fused_score = max((final_scores.get(str(n.get("id")), 0.0) for n in final_nodes), default=0.0)
-        for idx, node in enumerate(final_nodes[:top_k]):
-            if llm_ids:
-                denom = max(1, top_k - 1)
-                score = 1.0 if top_k == 1 else 1.0 - (idx / denom)
+        for node in final_nodes[:top_k]:
+            node_id = str(node.get("id", ""))
+            rerank_score = rerank_scores.get(node_id)
+            if rerank_score is not None:
+                score = rerank_score
             else:
-                fused_score = final_scores.get(str(node.get("id")), 0.0)
+                fused_score = final_scores.get(node_id, 0.0)
                 score = (fused_score / max_fused_score) if max_fused_score > 0 else 0.0
             score = max(0.0, min(score, 1.0))
             hits.append(
@@ -519,14 +586,21 @@ def main() -> None:
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Fallback base URL for embedding/LLM calls")
     parser.add_argument("--embed-base-url", default=DEFAULT_EMBED_BASE_URL, help="Embedding API URL")
     parser.add_argument("--llm-base-url", default=DEFAULT_LLM_BASE_URL, help="LLM API URL")
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="LLM model name")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="LLM model name (used for HyDE if enabled)")
+    parser.add_argument("--no-rerank", action="store_true", help="Disable hybrid BGE rerank")
+    parser.add_argument("--reranker-model", default=DEFAULT_RERANKER_MODEL, help="BGE reranker model")
+    parser.add_argument("--reranker-device", default=DEFAULT_RERANKER_DEVICE, help="Reranker device, e.g. cpu or cuda:0")
+    parser.add_argument("--reranker-fp16", action="store_true", help="Use FP16 for reranker (GPU only)")
+    parser.add_argument("--rerank-chunk-chars", type=int, default=DEFAULT_RERANK_CHUNK_CHARS, help="Chars per rerank chunk window")
+    parser.add_argument("--rerank-chunk-overlap", type=int, default=DEFAULT_RERANK_CHUNK_OVERLAP, help="Overlap chars between rerank chunks")
     parser.add_argument("--top-k", type=int, default=5, help="Number of results")
     parser.add_argument("--vector-top-n", type=int, default=40, help="Vector shortlist size")
     parser.add_argument("--candidate-cap", type=int, default=30, help="Max candidates before final rerank")
     parser.add_argument("--neighbor-depth", type=int, default=1, help="Neighbor expansion depth")
     parser.add_argument("--siblings-per-node", type=int, default=2, help="Sibling cap per expanded node")
-    parser.add_argument("--final-summary-chars", type=int, default=420, help="Summary chars per candidate for hybrid final rerank")
-    parser.add_argument("--final-text-chars", type=int, default=1500, help="Body excerpt chars per candidate for hybrid final rerank")
+    parser.add_argument("--candidate-file-roots", type=int, default=DEFAULT_CANDIDATE_FILE_ROOTS, help="Top file roots injected into expansion stage")
+    parser.add_argument("--no-expansion", action="store_true", help="Disable parent/child/sibling/file-root expansion and use vector seeds only")
+    parser.add_argument("--final-char-budget", type=int, default=DEFAULT_FINAL_CHAR_BUDGET, help="Legacy option (unused); kept for backward compatibility")
     parser.add_argument("--bm25-top-n", type=int, default=DEFAULT_BM25_TOP_N, help="Global BM25 shortlist size before fusion")
     parser.add_argument("--rrf-k", type=int, default=DEFAULT_RRF_K, help="RRF constant for vector(summary)/tree + BM25 fusion")
     parser.add_argument("--rrf-vector-weight", type=float, default=1.0, help="RRF weight for vector(summary)/tree branch")
@@ -536,7 +610,7 @@ def main() -> None:
     parser.add_argument("--hyde-temperature", type=float, default=DEFAULT_HYDE_TEMPERATURE, help="Temperature for HyDE generation")
     parser.add_argument("--hyde-max-chars", type=int, default=DEFAULT_HYDE_MAX_CHARS, help="Max chars kept per HyDE synthetic document")
     parser.add_argument("--content-chars", type=int, default=500, help="Max chars to show per result content")
-    parser.add_argument("--no-llm", action="store_true", help="Disable hybrid LLM rerank")
+    parser.add_argument("--no-llm", action="store_true", help="Deprecated alias for --no-rerank")
     parser.add_argument("query", nargs="*", help="One-shot query")
     args = parser.parse_args()
 
@@ -553,13 +627,19 @@ def main() -> None:
         model=args.model,
         chroma_dir=args.chroma_dir,
         collection=args.collection,
-        use_llm=not args.no_llm,
+        use_reranker=not (args.no_rerank or args.no_llm),
+        reranker_model=args.reranker_model,
+        reranker_device=args.reranker_device,
+        reranker_fp16=args.reranker_fp16,
+        rerank_chunk_chars=args.rerank_chunk_chars,
+        rerank_chunk_overlap=args.rerank_chunk_overlap,
         vector_top_n=args.vector_top_n,
         candidate_cap=args.candidate_cap,
         neighbor_depth=args.neighbor_depth,
         siblings_per_node=args.siblings_per_node,
-        summary_chars=args.final_summary_chars,
-        text_chars=args.final_text_chars,
+        candidate_file_roots=args.candidate_file_roots,
+        enable_expansion=not args.no_expansion,
+        final_char_budget=args.final_char_budget,
         bm25_top_n=args.bm25_top_n,
         rrf_k=args.rrf_k,
         rrf_vector_weight=args.rrf_vector_weight,

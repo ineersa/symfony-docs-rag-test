@@ -14,6 +14,12 @@ from pathlib import Path
 
 from hybrid_retrieve import HybridRetriever
 from pageindex_common import TreeRetriever, load_nodes
+from rerank_common import (
+    DEFAULT_RERANK_CHUNK_CHARS,
+    DEFAULT_RERANK_CHUNK_OVERLAP,
+    DEFAULT_RERANKER_DEVICE,
+    DEFAULT_RERANKER_MODEL,
+)
 
 DEFAULT_BASE_URL = "http://localhost:8052/v1"
 DEFAULT_MODEL = "local-model"
@@ -111,10 +117,11 @@ def main() -> None:
     parser.add_argument("--hybrid-candidate-cap", type=int, default=30, help="Candidate cap before rerank in hybrid mode")
     parser.add_argument("--hybrid-neighbor-depth", type=int, default=1, help="Neighbor expansion depth in hybrid mode")
     parser.add_argument("--hybrid-siblings-per-node", type=int, default=2, help="Sibling cap per node in hybrid mode")
+    parser.add_argument("--hybrid-candidate-file-roots", type=int, default=5, help="Top file roots injected during hybrid expansion")
+    parser.add_argument("--hybrid-no-expansion", action="store_true", help="Disable parent/child/sibling/file-root expansion in hybrid mode")
     parser.add_argument("--hybrid-embed-base-url", default=DEFAULT_HYBRID_EMBED_BASE_URL, help="Embedding API URL for hybrid mode")
     parser.add_argument("--hybrid-llm-base-url", default=DEFAULT_HYBRID_LLM_BASE_URL, help="LLM API URL for hybrid mode")
-    parser.add_argument("--hybrid-final-summary-chars", type=int, default=420, help="Summary chars per candidate in hybrid final rerank")
-    parser.add_argument("--hybrid-final-text-chars", type=int, default=1500, help="Body excerpt chars per candidate in hybrid final rerank")
+    parser.add_argument("--hybrid-final-char-budget", type=int, default=35000, help="Legacy option (unused); kept for backward compatibility")
     parser.add_argument("--hybrid-bm25-top-n", type=int, default=80, help="Global BM25 shortlist size before hybrid fusion")
     parser.add_argument("--hybrid-rrf-k", type=int, default=60, help="RRF constant for hybrid vector(summary)/tree + BM25 fusion")
     parser.add_argument("--hybrid-rrf-vector-weight", type=float, default=1.0, help="RRF weight for hybrid vector(summary)/tree branch")
@@ -123,7 +130,13 @@ def main() -> None:
     parser.add_argument("--hybrid-hyde-variant-weight", type=float, default=0.7, help="Score weight applied to each hybrid HyDE variant")
     parser.add_argument("--hybrid-hyde-temperature", type=float, default=0.3, help="Temperature for hybrid HyDE generation")
     parser.add_argument("--hybrid-hyde-max-chars", type=int, default=420, help="Max chars kept per hybrid HyDE synthetic document")
-    parser.add_argument("--hybrid-no-llm", action="store_true", help="Disable hybrid LLM rerank")
+    parser.add_argument("--hybrid-no-rerank", action="store_true", help="Disable hybrid BGE rerank")
+    parser.add_argument("--hybrid-reranker-model", default=DEFAULT_RERANKER_MODEL, help="BGE reranker model for hybrid mode")
+    parser.add_argument("--hybrid-reranker-device", default=DEFAULT_RERANKER_DEVICE, help="Reranker device for hybrid mode")
+    parser.add_argument("--hybrid-reranker-fp16", action="store_true", help="Use FP16 for hybrid reranker (GPU only)")
+    parser.add_argument("--hybrid-rerank-chunk-chars", type=int, default=DEFAULT_RERANK_CHUNK_CHARS, help="Chars per rerank chunk window in hybrid mode")
+    parser.add_argument("--hybrid-rerank-chunk-overlap", type=int, default=DEFAULT_RERANK_CHUNK_OVERLAP, help="Overlap chars between rerank chunks in hybrid mode")
+    parser.add_argument("--hybrid-no-llm", action="store_true", help="Deprecated alias for --hybrid-no-rerank")
     args = parser.parse_args()
 
     if not args.nodes_file.is_file():
@@ -157,13 +170,19 @@ def main() -> None:
             model=args.model,
             chroma_dir=args.chroma_dir,
             collection=args.hybrid_collection,
-            use_llm=not args.hybrid_no_llm,
+            use_reranker=not (args.hybrid_no_rerank or args.hybrid_no_llm),
+            reranker_model=args.hybrid_reranker_model,
+            reranker_device=args.hybrid_reranker_device,
+            reranker_fp16=args.hybrid_reranker_fp16,
+            rerank_chunk_chars=args.hybrid_rerank_chunk_chars,
+            rerank_chunk_overlap=args.hybrid_rerank_chunk_overlap,
             vector_top_n=args.hybrid_vector_top_n,
             candidate_cap=args.hybrid_candidate_cap,
             neighbor_depth=args.hybrid_neighbor_depth,
             siblings_per_node=args.hybrid_siblings_per_node,
-            summary_chars=args.hybrid_final_summary_chars,
-            text_chars=args.hybrid_final_text_chars,
+            candidate_file_roots=args.hybrid_candidate_file_roots,
+            enable_expansion=not args.hybrid_no_expansion,
+            final_char_budget=args.hybrid_final_char_budget,
             bm25_top_n=args.hybrid_bm25_top_n,
             rrf_k=args.hybrid_rrf_k,
             rrf_vector_weight=args.hybrid_rrf_vector_weight,

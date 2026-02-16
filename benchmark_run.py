@@ -18,8 +18,25 @@ from rich.progress import Progress
 from rich.table import Table
 
 from bm25_common import BM25Index, reciprocal_rank_fusion
+from hyde_common import (
+    DEFAULT_HYDE_BASE_URL,
+    DEFAULT_HYDE_MAX_CHARS,
+    DEFAULT_HYDE_MODEL,
+    DEFAULT_HYDE_TEMPERATURE,
+    DEFAULT_HYDE_VARIANT_WEIGHT,
+    DEFAULT_HYDE_VARIANTS,
+    HyDEGenerator,
+)
 from hybrid_retrieve import HybridRetriever
 from pageindex_common import TreeRetriever, load_nodes
+from rerank_common import (
+    BGEReranker,
+    DEFAULT_RERANK_CHUNK_CHARS,
+    DEFAULT_RERANK_CHUNK_OVERLAP,
+    DEFAULT_RERANKER_DEVICE,
+    DEFAULT_RERANKER_MODEL,
+    build_rerank_passage,
+)
 
 DEFAULT_QUESTIONS = Path("data/benchmark/questions.jsonl")
 DEFAULT_RESULTS = Path("data/benchmark/results.json")
@@ -33,6 +50,9 @@ DEFAULT_TOP_K = 5
 DEFAULT_LOCAL_VECTOR_CANDIDATES = 40
 DEFAULT_LOCAL_BM25_CANDIDATES = 40
 DEFAULT_LOCAL_RRF_K = 60
+DEFAULT_LOCAL_RERANK_CANDIDATES = 25
+DEFAULT_LOCAL_HYDE_VARIANTS = DEFAULT_HYDE_VARIANTS
+DEFAULT_LOCAL_HYDE_VARIANT_WEIGHT = DEFAULT_HYDE_VARIANT_WEIGHT
 DEFAULT_PAGEINDEX_NODES = Path("data/pageindex/nodes.jsonl")
 DEFAULT_PAGEINDEX_MODEL = "local-model"
 DEFAULT_HYBRID_BASE_URL = DEFAULT_BASE_URL
@@ -43,10 +63,14 @@ DEFAULT_HYBRID_VECTOR_TOP_N = 40
 DEFAULT_HYBRID_CANDIDATE_CAP = 30
 DEFAULT_HYBRID_NEIGHBOR_DEPTH = 1
 DEFAULT_HYBRID_SIBLINGS = 2
+DEFAULT_HYBRID_CANDIDATE_FILE_ROOTS = 5
+DEFAULT_HYBRID_FINAL_CHAR_BUDGET = 35_000
 DEFAULT_HYBRID_HYDE_VARIANTS = 0
 DEFAULT_HYBRID_HYDE_VARIANT_WEIGHT = 0.7
 DEFAULT_HYBRID_HYDE_TEMPERATURE = 0.3
 DEFAULT_HYBRID_HYDE_MAX_CHARS = 420
+DEFAULT_HYBRID_RERANK_CHUNK_CHARS = DEFAULT_RERANK_CHUNK_CHARS
+DEFAULT_HYBRID_RERANK_CHUNK_OVERLAP = DEFAULT_RERANK_CHUNK_OVERLAP
 
 QUERY_PREFIX = "Represent this query for searching relevant code: "
 
@@ -93,14 +117,48 @@ class LocalChromaPredictor(Predictor):
         vector_candidates: int,
         bm25_candidates: int,
         rrf_k: int,
+        rerank_enabled: bool,
+        rerank_candidates: int,
+        reranker_model: str,
+        reranker_device: str,
+        reranker_fp16: bool,
+        hyde_variants: int,
+        hyde_variant_weight: float,
+        hyde_base_url: str,
+        hyde_model: str,
+        hyde_temperature: float,
+        hyde_max_chars: int,
     ):
         super().__init__()
         self.client = OpenAI(base_url=base_url, api_key="not-needed")
         self.vector_candidates = max(1, vector_candidates)
         self.bm25_candidates = max(1, bm25_candidates)
         self.rrf_k = max(1, rrf_k)
+        self.rerank_candidates = max(1, rerank_candidates)
+        self.hyde_variant_weight = max(0.0, hyde_variant_weight)
         chroma_client = chromadb.PersistentClient(path=str(chroma_dir))
         self.collection = chroma_client.get_collection(collection)
+        self.reranker = (
+            BGEReranker(
+                reranker_model,
+                device=reranker_device,
+                use_fp16=reranker_fp16,
+                normalize=True,
+            )
+            if rerank_enabled
+            else None
+        )
+        self.hyde = (
+            HyDEGenerator(
+                base_url=hyde_base_url,
+                model=hyde_model,
+                variants=hyde_variants,
+                temperature=hyde_temperature,
+                max_chars=hyde_max_chars,
+            )
+            if hyde_variants > 0
+            else None
+        )
 
         corpus = self.collection.get(include=["documents", "metadatas"])
         self.corpus_ids = [str(x) for x in (corpus.get("ids") or [])]
@@ -122,65 +180,116 @@ class LocalChromaPredictor(Predictor):
             )
         self.bm25 = BM25Index(bm25_texts)
 
-    def _embed_query(self, query: str) -> list[float]:
-        enriched = query
-        if "symfony" not in query.lower():
-            enriched = f"{query} (Symfony PHP framework)"
-        prefixed = f"{QUERY_PREFIX}{enriched}"
-        response = self.client.embeddings.create(input=[prefixed], model="CodeRankEmbed")
-        return response.data[0].embedding
+    def _embed_queries(self, queries: list[str]) -> list[list[float]]:
+        if not queries:
+            return []
+        enriched_queries: list[str] = []
+        for q in queries:
+            enriched = q
+            if "symfony" not in q.lower():
+                enriched = f"{q} (Symfony PHP framework)"
+            enriched_queries.append(f"{QUERY_PREFIX}{enriched}")
+        response = self.client.embeddings.create(input=enriched_queries, model="CodeRankEmbed")
+        return [item.embedding for item in response.data]
 
     def predict(self, query: str, top_k: int) -> list[Hit]:
         started = time.perf_counter()
-        embedding = self._embed_query(query)
-        result = self.collection.query(
-            query_embeddings=[embedding],
-            n_results=max(top_k, self.vector_candidates),
-            include=["metadatas", "distances", "documents"],
-        )
+        query_texts = [query]
+        vector_weights = [1.0]
+        hyde_usage: dict[str, int] = {"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        if self.hyde:
+            for variant in self.hyde.generate(query):
+                query_texts.append(variant)
+                vector_weights.append(self.hyde_variant_weight)
+            hyde_usage = self.hyde.consume_usage()
 
-        ids_raw = result.get("ids") or [[]]
-        docs_raw = result.get("documents") or [[]]
-        metadatas_raw = result.get("metadatas") or [[]]
-        distances_raw = result.get("distances") or [[]]
-        ids = [str(x) for x in (ids_raw[0] if ids_raw else [])]
-        documents = docs_raw[0] if docs_raw else []
-        metadatas = metadatas_raw[0] if metadatas_raw else []
-        distances = distances_raw[0] if distances_raw else []
-
+        embeddings = self._embed_queries(query_texts)
+        rank_lists: list[list[str]] = []
+        rank_weights: list[float] = []
         vector_by_id: dict[str, tuple[str, dict, float]] = {}
-        for hit_id, doc, meta, dist in zip(ids, documents, metadatas, distances):
-            vector_by_id[hit_id] = (str(doc or ""), dict(meta or {}), float(dist) if dist is not None else 1.0)
+        for embedding, weight in zip(embeddings, vector_weights):
+            if weight <= 0:
+                continue
+            result = self.collection.query(
+                query_embeddings=[embedding],
+                n_results=max(top_k, self.vector_candidates),
+                include=["metadatas", "distances", "documents"],
+            )
+
+            ids_raw = result.get("ids") or [[]]
+            docs_raw = result.get("documents") or [[]]
+            metadatas_raw = result.get("metadatas") or [[]]
+            distances_raw = result.get("distances") or [[]]
+            ids = [str(x) for x in (ids_raw[0] if ids_raw else [])]
+            documents = docs_raw[0] if docs_raw else []
+            metadatas = metadatas_raw[0] if metadatas_raw else []
+            distances = distances_raw[0] if distances_raw else []
+
+            rank_lists.append(ids)
+            rank_weights.append(float(weight))
+            for hit_id, doc, meta, dist in zip(ids, documents, metadatas, distances):
+                dist_val = float(dist) if dist is not None else 1.0
+                if hit_id not in vector_by_id or dist_val < vector_by_id[hit_id][2]:
+                    vector_by_id[hit_id] = (str(doc or ""), dict(meta or {}), dist_val)
 
         bm25_hits = self.bm25.search(query, self.bm25_candidates)
         bm25_ids = [self.corpus_ids[h.index] for h in bm25_hits if 0 <= h.index < len(self.corpus_ids)]
 
-        fused = reciprocal_rank_fusion([ids, bm25_ids], rrf_k=self.rrf_k)
-        top_ids = [doc_id for doc_id, _ in fused[:top_k]]
+        fused = reciprocal_rank_fusion(rank_lists + [bm25_ids], rrf_k=self.rrf_k, weights=rank_weights + [1.0])
+        candidate_cap = max(top_k, self.rerank_candidates) if self.reranker else top_k
+        candidate_ids = [doc_id for doc_id, _ in fused[:candidate_cap]]
 
-        hits: list[Hit] = []
-        for hit_id in top_ids:
+        candidates: list[dict] = []
+        for hit_id in candidate_ids:
             if hit_id in vector_by_id:
-                _, meta, dist = vector_by_id[hit_id]
+                doc, meta, dist = vector_by_id[hit_id]
             else:
                 row = self.id_to_row.get(hit_id)
                 if row is None:
                     continue
                 meta = dict(self.corpus_metas[row] or {})
+                doc = str(self.corpus_docs[row] or "")
                 dist = 0.99
+            candidates.append(
+                {
+                    "id": hit_id,
+                    "doc": str(doc or ""),
+                    "meta": dict(meta or {}),
+                    "distance": float(dist) if dist is not None else 1.0,
+                }
+            )
+
+        if self.reranker and candidates:
+            passages = [build_rerank_passage(c["meta"], c["doc"]) for c in candidates]
+            scores = self.reranker.score(query, passages)
+            for c, score in zip(candidates, scores):
+                c["rerank_score"] = score
+                c["distance"] = 1.0 - score
+            candidates.sort(key=lambda c: float(c.get("rerank_score", 0.0)), reverse=True)
+
+        hits: list[Hit] = []
+        for candidate in candidates[:top_k]:
+            meta = candidate["meta"]
+            dist = candidate["distance"]
 
             ls = meta.get("line_start")
             le = meta.get("line_end")
             hits.append(
                 Hit(
-                    id=str(hit_id),
+                    id=str(candidate["id"]),
                     source=str(meta.get("source", "")),
                     line_start=int(ls) if isinstance(ls, (int, float, str)) and str(ls).isdigit() else None,
                     line_end=int(le) if isinstance(le, (int, float, str)) and str(le).isdigit() else None,
                     distance=float(dist) if dist is not None else None,
                 )
             )
-        self._set_usage(latency_ms=(time.perf_counter() - started) * 1000)
+        self._set_usage(
+            latency_ms=(time.perf_counter() - started) * 1000,
+            llm_calls=int(hyde_usage.get("llm_calls", 0)),
+            prompt_tokens=int(hyde_usage.get("prompt_tokens", 0)),
+            completion_tokens=int(hyde_usage.get("completion_tokens", 0)),
+            total_tokens=int(hyde_usage.get("total_tokens", 0)),
+        )
         return hits
 
 
@@ -300,9 +409,15 @@ class HybridPredictor(Predictor):
         candidate_cap: int,
         neighbor_depth: int,
         siblings_per_node: int,
-        no_llm: bool,
-        summary_chars: int,
-        text_chars: int,
+        candidate_file_roots: int,
+        no_expansion: bool,
+        no_rerank: bool,
+        reranker_model: str,
+        reranker_device: str,
+        reranker_fp16: bool,
+        rerank_chunk_chars: int,
+        rerank_chunk_overlap: int,
+        final_char_budget: int,
         bm25_top_n: int,
         rrf_k: int,
         rrf_vector_weight: float,
@@ -324,13 +439,19 @@ class HybridPredictor(Predictor):
             model=model,
             chroma_dir=chroma_dir,
             collection=collection,
-            use_llm=not no_llm,
+            use_reranker=not no_rerank,
+            reranker_model=reranker_model,
+            reranker_device=reranker_device,
+            reranker_fp16=reranker_fp16,
+            rerank_chunk_chars=rerank_chunk_chars,
+            rerank_chunk_overlap=rerank_chunk_overlap,
             vector_top_n=vector_top_n,
             candidate_cap=candidate_cap,
             neighbor_depth=neighbor_depth,
             siblings_per_node=siblings_per_node,
-            summary_chars=summary_chars,
-            text_chars=text_chars,
+            candidate_file_roots=candidate_file_roots,
+            enable_expansion=not no_expansion,
+            final_char_budget=final_char_budget,
             bm25_top_n=bm25_top_n,
             rrf_k=rrf_k,
             rrf_vector_weight=rrf_vector_weight,
@@ -421,6 +542,17 @@ def main() -> None:
     parser.add_argument("--local-vector-candidates", type=int, default=DEFAULT_LOCAL_VECTOR_CANDIDATES, help="Vector shortlist size before local RRF")
     parser.add_argument("--local-bm25-candidates", type=int, default=DEFAULT_LOCAL_BM25_CANDIDATES, help="BM25 shortlist size before local RRF")
     parser.add_argument("--local-rrf-k", type=int, default=DEFAULT_LOCAL_RRF_K, help="RRF constant for local predictor")
+    parser.add_argument("--local-no-rerank", action="store_true", help="Disable BGE reranking for local predictor")
+    parser.add_argument("--local-reranker-model", default=DEFAULT_RERANKER_MODEL, help="BGE reranker model for local predictor")
+    parser.add_argument("--local-reranker-device", default=DEFAULT_RERANKER_DEVICE, help="Reranker device for local predictor")
+    parser.add_argument("--local-reranker-fp16", action="store_true", help="Use FP16 for local reranker (GPU only)")
+    parser.add_argument("--local-rerank-candidates", type=int, default=DEFAULT_LOCAL_RERANK_CANDIDATES, help="RRF candidates passed to local reranker")
+    parser.add_argument("--local-hyde-variants", type=int, default=DEFAULT_LOCAL_HYDE_VARIANTS, help="HyDE variant count for local dense retrieval (0 disables)")
+    parser.add_argument("--local-hyde-variant-weight", type=float, default=DEFAULT_LOCAL_HYDE_VARIANT_WEIGHT, help="RRF weight applied to each local HyDE vector branch")
+    parser.add_argument("--local-hyde-base-url", default=DEFAULT_HYDE_BASE_URL, help="HyDE LLM API URL for local predictor")
+    parser.add_argument("--local-hyde-model", default=DEFAULT_HYDE_MODEL, help="HyDE model name for local predictor")
+    parser.add_argument("--local-hyde-temperature", type=float, default=DEFAULT_HYDE_TEMPERATURE, help="Temperature for local HyDE generation")
+    parser.add_argument("--local-hyde-max-chars", type=int, default=DEFAULT_HYDE_MAX_CHARS, help="Max chars kept per local HyDE synthetic chunk")
     parser.add_argument("--pageindex-base-url", default=DEFAULT_PAGEINDEX_BASE_URL, help="LLM API URL for PageIndex predictor")
     parser.add_argument("--collection", default=DEFAULT_COLLECTION, help="Chroma collection for local predictor")
     parser.add_argument("--chroma-dir", type=Path, default=DEFAULT_CHROMA_DIR, help="Chroma dir for local predictor")
@@ -440,13 +572,22 @@ def main() -> None:
     parser.add_argument("--hybrid-base-url", default=DEFAULT_HYBRID_BASE_URL, help="API URL for hybrid embedding/LLM calls")
     parser.add_argument("--hybrid-embed-base-url", default=DEFAULT_HYBRID_EMBED_BASE_URL, help="Embedding API URL for hybrid")
     parser.add_argument("--hybrid-llm-base-url", default=DEFAULT_HYBRID_LLM_BASE_URL, help="LLM API URL for hybrid")
-    parser.add_argument("--hybrid-model", default=DEFAULT_PAGEINDEX_MODEL, help="Model name for hybrid LLM rerank")
+    parser.add_argument("--hybrid-model", default=DEFAULT_PAGEINDEX_MODEL, help="Model name for hybrid HyDE generation")
     parser.add_argument("--hybrid-collection", default=DEFAULT_HYBRID_COLLECTION, help="Chroma collection with hybrid node-summary vectors")
     parser.add_argument("--hybrid-vector-top-n", type=int, default=DEFAULT_HYBRID_VECTOR_TOP_N, help="Vector shortlist size for hybrid")
     parser.add_argument("--hybrid-candidate-cap", type=int, default=DEFAULT_HYBRID_CANDIDATE_CAP, help="Max candidates kept before final hybrid rerank")
     parser.add_argument("--hybrid-neighbor-depth", type=int, default=DEFAULT_HYBRID_NEIGHBOR_DEPTH, help="Neighbor expansion depth for hybrid")
     parser.add_argument("--hybrid-siblings-per-node", type=int, default=DEFAULT_HYBRID_SIBLINGS, help="Sibling cap per expanded node in hybrid")
-    parser.add_argument("--hybrid-no-llm", action="store_true", help="Disable hybrid LLM rerank and use fused rank fallback")
+    parser.add_argument("--hybrid-candidate-file-roots", type=int, default=DEFAULT_HYBRID_CANDIDATE_FILE_ROOTS, help="Top file roots injected during hybrid expansion")
+    parser.add_argument("--hybrid-no-expansion", action="store_true", help="Disable parent/child/sibling/file-root expansion in hybrid")
+    parser.add_argument("--hybrid-no-rerank", action="store_true", help="Disable hybrid BGE rerank and use fused rank fallback")
+    parser.add_argument("--hybrid-reranker-model", default=DEFAULT_RERANKER_MODEL, help="BGE reranker model for hybrid")
+    parser.add_argument("--hybrid-reranker-device", default=DEFAULT_RERANKER_DEVICE, help="Reranker device for hybrid")
+    parser.add_argument("--hybrid-reranker-fp16", action="store_true", help="Use FP16 for hybrid reranker (GPU only)")
+    parser.add_argument("--hybrid-rerank-chunk-chars", type=int, default=DEFAULT_HYBRID_RERANK_CHUNK_CHARS, help="Chars per rerank chunk window in hybrid")
+    parser.add_argument("--hybrid-rerank-chunk-overlap", type=int, default=DEFAULT_HYBRID_RERANK_CHUNK_OVERLAP, help="Overlap chars between rerank chunks in hybrid")
+    parser.add_argument("--hybrid-no-llm", action="store_true", help="Deprecated alias for --hybrid-no-rerank")
+    parser.add_argument("--hybrid-final-char-budget", type=int, default=DEFAULT_HYBRID_FINAL_CHAR_BUDGET, help="Legacy option (unused); kept for backward compatibility")
     parser.add_argument("--hybrid-nodes", type=Path, default=DEFAULT_PAGEINDEX_NODES, help="Nodes JSONL for hybrid retrieval")
     parser.add_argument("--hybrid-bm25-top-n", type=int, default=80, help="Global BM25 shortlist size for hybrid RRF")
     parser.add_argument("--hybrid-rrf-k", type=int, default=60, help="RRF constant for hybrid vector(summary)/tree + BM25 fusion")
@@ -482,6 +623,17 @@ def main() -> None:
             vector_candidates=args.local_vector_candidates,
             bm25_candidates=args.local_bm25_candidates,
             rrf_k=args.local_rrf_k,
+            rerank_enabled=not args.local_no_rerank,
+            rerank_candidates=args.local_rerank_candidates,
+            reranker_model=args.local_reranker_model,
+            reranker_device=args.local_reranker_device,
+            reranker_fp16=args.local_reranker_fp16,
+            hyde_variants=args.local_hyde_variants,
+            hyde_variant_weight=args.local_hyde_variant_weight,
+            hyde_base_url=args.local_hyde_base_url,
+            hyde_model=args.local_hyde_model,
+            hyde_temperature=args.local_hyde_temperature,
+            hyde_max_chars=args.local_hyde_max_chars,
         )
     elif args.predictor == "api":
         if not args.api_endpoint:
@@ -516,9 +668,15 @@ def main() -> None:
             candidate_cap=args.hybrid_candidate_cap,
             neighbor_depth=args.hybrid_neighbor_depth,
             siblings_per_node=args.hybrid_siblings_per_node,
-            no_llm=args.hybrid_no_llm,
-            summary_chars=args.pageindex_final_summary_chars,
-            text_chars=args.pageindex_final_text_chars,
+            candidate_file_roots=args.hybrid_candidate_file_roots,
+            no_expansion=args.hybrid_no_expansion,
+            no_rerank=(args.hybrid_no_rerank or args.hybrid_no_llm),
+            reranker_model=args.hybrid_reranker_model,
+            reranker_device=args.hybrid_reranker_device,
+            reranker_fp16=args.hybrid_reranker_fp16,
+            rerank_chunk_chars=args.hybrid_rerank_chunk_chars,
+            rerank_chunk_overlap=args.hybrid_rerank_chunk_overlap,
+            final_char_budget=args.hybrid_final_char_budget,
             bm25_top_n=args.hybrid_bm25_top_n,
             rrf_k=args.hybrid_rrf_k,
             rrf_vector_weight=args.hybrid_rrf_vector_weight,
