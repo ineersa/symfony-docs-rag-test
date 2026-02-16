@@ -1,4 +1,27 @@
-# Hybrid Retrieval Plan (Vector + PageIndex)
+# Hybrid Retrieval Plan (Vector + BM25 + Tree)
+
+## Updated rollout (2026-02)
+
+1. Add BM25 with `bm25s` and use it in both pipelines:
+   - simple RAG (`retrieve.py` + benchmark local predictor)
+   - hybrid retriever (`hybrid_retrieve.py`)
+2. Replace lexical-overlap ranking in hybrid with global BM25 branch.
+3. Fuse dense and BM25 with proper Reciprocal Rank Fusion (RRF, default `k=60`).
+4. Keep PageIndex-only retriever out of scope for future work.
+5. Validate that commands run correctly (smoke checks only; full benchmark runs are manual).
+
+Quick validation commands:
+
+```bash
+uv run python retrieve.py "how to configure symfony routing"
+uv run python hybrid_retrieve.py --no-llm "how to configure symfony routing"
+uv run python benchmark_run.py --mode both --predictor local --sample-size 20 --sample-seed 42
+uv run python benchmark_run.py --mode both --predictor hybrid --sample-size 20 --sample-seed 42 --hybrid-no-llm
+```
+
+Notes:
+- Use small sample sizes for verification speed; run larger benchmarks separately.
+- Expose BM25/RRF tuning flags for local and hybrid predictors.
 
 Goal: combine fast vector recall with structured PageIndex reranking to improve quality/latency over pure PageIndex traversal.
 

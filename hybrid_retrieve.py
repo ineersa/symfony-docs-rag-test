@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hybrid retrieval: vector shortlist + PageIndex reranking."""
+"""Hybrid retrieval: summary-vector + tree expansion + BM25 + optional LLM reranking."""
 
 from __future__ import annotations
 
@@ -13,17 +13,19 @@ from openai import OpenAI
 from rich.console import Console
 from rich.panel import Panel
 
-from pageindex_common import QUERY_PREFIX, RetrievedHit, lexical_score, load_nodes, parse_json_obj
+from bm25_common import BM25Index, reciprocal_rank_fusion
+from pageindex_common import QUERY_PREFIX, RetrievedHit, load_nodes, parse_json_obj
 
 
 DEFAULT_CHROMA_DIR = Path("data/chroma")
-DEFAULT_COLLECTION = "symfony_docs"
-DEFAULT_CHUNKS_FILE = Path("data/chunks.jsonl")
+DEFAULT_COLLECTION = "symfony_pageindex_summaries"
 DEFAULT_NODES_FILE = Path("data/pageindex/nodes.jsonl")
 DEFAULT_BASE_URL = "http://localhost:8059/v1"
 DEFAULT_EMBED_BASE_URL = "http://localhost:8059/v1"
 DEFAULT_LLM_BASE_URL = "http://localhost:4321/v1"
 DEFAULT_MODEL = "local-model"
+DEFAULT_BM25_TOP_N = 80
+DEFAULT_RRF_K = 60
 
 
 @dataclass
@@ -32,19 +34,6 @@ class _NodeEvidence:
     best_distance: float = 1.0
     hit_count: int = 0
     best_rank: int = 10_000
-
-
-def _line_overlap(a_start: int | None, a_end: int | None, b_start: int | None, b_end: int | None) -> bool:
-    if not isinstance(a_start, int) or not isinstance(a_end, int):
-        return False
-    if not isinstance(b_start, int) or not isinstance(b_end, int):
-        return False
-    return max(a_start, b_start) <= min(a_end, b_end)
-
-
-def _line_start_key(node: dict[str, Any]) -> int:
-    line_start = node.get("line_start")
-    return line_start if isinstance(line_start, int) else 10**9
 
 
 class HybridRetriever:
@@ -58,7 +47,6 @@ class HybridRetriever:
         llm_base_url: str | None = None,
         chroma_dir: Path = DEFAULT_CHROMA_DIR,
         collection: str = DEFAULT_COLLECTION,
-        chunks_file: Path = DEFAULT_CHUNKS_FILE,
         use_llm: bool = True,
         vector_top_n: int = 40,
         candidate_cap: int = 30,
@@ -67,6 +55,10 @@ class HybridRetriever:
         candidate_file_roots: int = 5,
         summary_chars: int = 420,
         text_chars: int = 1500,
+        bm25_top_n: int = DEFAULT_BM25_TOP_N,
+        rrf_k: int = DEFAULT_RRF_K,
+        rrf_vector_weight: float = 1.0,
+        rrf_bm25_weight: float = 1.0,
     ):
         self.nodes = nodes
         self.model = model
@@ -78,6 +70,10 @@ class HybridRetriever:
         self.candidate_file_roots = candidate_file_roots
         self.summary_chars = summary_chars
         self.text_chars = text_chars
+        self.bm25_top_n = max(1, bm25_top_n)
+        self.rrf_k = max(1, rrf_k)
+        self.rrf_vector_weight = max(0.0, rrf_vector_weight)
+        self.rrf_bm25_weight = max(0.0, rrf_bm25_weight)
         embed_url = embed_base_url or base_url
         llm_url = llm_base_url or base_url
         self.embedding_client = OpenAI(base_url=embed_url, api_key="not-needed")
@@ -88,40 +84,13 @@ class HybridRetriever:
         chroma_client = chromadb.PersistentClient(path=str(chroma_dir))
         self.collection = chroma_client.get_collection(collection)
 
-        self.chunk_meta = self._load_chunk_metadata(chunks_file)
-        self.nodes_by_source = self._index_nodes_by_source()
         self.file_node_by_source = self._index_file_roots()
+        self.bm25_node_ids, self.bm25 = self._build_bm25_index()
 
     def consume_usage(self) -> dict[str, int]:
         out = dict(self._usage)
         self._usage = {"llm_calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         return out
-
-    def _load_chunk_metadata(self, chunks_file: Path) -> dict[str, dict]:
-        by_id: dict[str, dict] = {}
-        if not chunks_file.is_file():
-            return by_id
-        with open(chunks_file, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                row = json.loads(line)
-                by_id[str(row.get("id", ""))] = row.get("metadata", {})
-        return by_id
-
-    def _index_nodes_by_source(self) -> dict[str, list[dict]]:
-        by_source: dict[str, list[dict]] = {}
-        for n in self.nodes.values():
-            source = n.get("source")
-            if not source:
-                continue
-            if n.get("kind") not in {"section", "top"}:
-                continue
-            by_source.setdefault(str(source), []).append(n)
-        for source, values in by_source.items():
-            by_source[source] = sorted(values, key=_line_start_key)
-        return by_source
 
     def _index_file_roots(self) -> dict[str, str]:
         out: dict[str, str] = {}
@@ -152,71 +121,75 @@ class HybridRetriever:
             ]
         ).strip()
 
-    def _map_chunk_to_nodes(self, source: str, line_start: int | None, line_end: int | None, breadcrumb: str | None) -> list[str]:
-        candidates = self.nodes_by_source.get(source, [])
-        matched: list[str] = []
-        for n in candidates:
-            if _line_overlap(line_start, line_end, n.get("line_start"), n.get("line_end")):
-                matched.append(str(n["id"]))
-        if matched:
-            return matched
+    def _node_bm25_text(self, node: dict[str, Any]) -> str:
+        return "\n".join(
+            [
+                str(node.get("source") or ""),
+                str(node.get("title") or ""),
+                str(node.get("breadcrumb") or ""),
+                str((node.get("text") or "")[:1800]),
+            ]
+        ).strip()
 
-        if breadcrumb:
-            norm = str(breadcrumb).strip().lower()
-            for n in candidates:
-                if str(n.get("breadcrumb", "")).strip().lower() == norm:
-                    matched.append(str(n["id"]))
-        return matched
+    def _build_bm25_index(self) -> tuple[list[str], BM25Index]:
+        eligible_nodes: list[dict[str, Any]] = [
+            n
+            for n in self.nodes.values()
+            if n.get("source") and n.get("kind") in {"section", "top", "file"}
+        ]
+        eligible_nodes = sorted(eligible_nodes, key=lambda n: str(n.get("id", "")))
+        node_ids = [str(n["id"]) for n in eligible_nodes]
+        texts = [self._node_bm25_text(n) for n in eligible_nodes]
+        return node_ids, BM25Index(texts)
+
+    def _bm25_rank(self, query: str) -> list[str]:
+        hits = self.bm25.search(query, self.bm25_top_n)
+        out: list[str] = []
+        for h in hits:
+            if 0 <= h.index < len(self.bm25_node_ids):
+                out.append(self.bm25_node_ids[h.index])
+        return out
 
     def _vector_shortlist(self, query: str) -> tuple[dict[str, _NodeEvidence], dict[str, float]]:
         embedding = self._embed_query(query)
         result = self.collection.query(
             query_embeddings=[embedding],
             n_results=self.vector_top_n,
-            include=["metadatas", "distances"],
+            include=["distances"],
         )
 
         ids_raw = result.get("ids") or [[]]
-        metadatas_raw = result.get("metadatas") or [[]]
         distances_raw = result.get("distances") or [[]]
         ids = ids_raw[0] if ids_raw else []
-        metadatas = metadatas_raw[0] if metadatas_raw else []
         distances = distances_raw[0] if distances_raw else []
 
         evidence: dict[str, _NodeEvidence] = {}
         file_scores: dict[str, float] = {}
 
-        for idx, (chunk_id, meta, dist) in enumerate(zip(ids, metadatas, distances)):
-            meta = dict(meta or {})
+        for idx, (node_id_raw, dist) in enumerate(zip(ids, distances)):
+            node_id = str(node_id_raw)
+            node = self.nodes.get(node_id)
+            if not node:
+                continue
+            if node.get("kind") not in {"section", "top", "file"}:
+                continue
+
             distance = float(dist) if dist is not None else 1.0
             rank_weight = 1.0 / (idx + 1)
             closeness = max(0.0, 1.0 - distance)
             per_hit_score = (0.7 * closeness) + (0.3 * rank_weight)
 
-            if chunk_id in self.chunk_meta:
-                merged = dict(self.chunk_meta[chunk_id])
-                merged.update(meta)
-                meta = merged
-
-            source = str(meta.get("source", ""))
+            source = str(node.get("source", ""))
             if source:
                 file_scores[source] = max(file_scores.get(source, 0.0), per_hit_score)
 
-            chunk_ls = meta.get("line_start")
-            chunk_le = meta.get("line_end")
-            ls = int(chunk_ls) if isinstance(chunk_ls, (int, float, str)) and str(chunk_ls).isdigit() else None
-            le = int(chunk_le) if isinstance(chunk_le, (int, float, str)) and str(chunk_le).isdigit() else None
-            breadcrumb = str(meta.get("breadcrumb", "")) if meta.get("breadcrumb") else None
-
-            mapped_ids = self._map_chunk_to_nodes(source, ls, le, breadcrumb)
-            for node_id in mapped_ids:
-                e = evidence.setdefault(node_id, _NodeEvidence())
-                e.score += per_hit_score
-                e.hit_count += 1
-                if distance < e.best_distance:
-                    e.best_distance = distance
-                if idx < e.best_rank:
-                    e.best_rank = idx
+            e = evidence.setdefault(node_id, _NodeEvidence())
+            e.score += per_hit_score
+            e.hit_count += 1
+            if distance < e.best_distance:
+                e.best_distance = distance
+            if idx < e.best_rank:
+                e.best_rank = idx
 
         return evidence, file_scores
 
@@ -323,8 +296,6 @@ class HybridRetriever:
 
     def retrieve(self, query: str, *, top_k: int = 5) -> list[RetrievedHit]:
         evidence, file_scores = self._vector_shortlist(query)
-        if not evidence and not file_scores:
-            return []
 
         seed_ranked = sorted(
             evidence.items(),
@@ -337,7 +308,6 @@ class HybridRetriever:
         # Collect nodes and raw scores for RRF
         nodes_pool: dict[str, dict] = {}
         hybrid_scores: dict[str, float] = {}
-        lexical_scores: dict[str, float] = {}
 
         for node_id, hybrid_score in expanded_scores.items():
             node = self.nodes.get(node_id)
@@ -348,28 +318,29 @@ class HybridRetriever:
 
             nodes_pool[node_id] = node
             hybrid_scores[node_id] = hybrid_score
-            lexical_scores[node_id] = lexical_score(query, self._candidate_text(node))
+
+        bm25_ids = self._bm25_rank(query)
+        for node_id in bm25_ids:
+            node = self.nodes.get(node_id)
+            if not node:
+                continue
+            if node.get("kind") not in {"section", "top", "file"}:
+                continue
+            nodes_pool[node_id] = node
 
         if not nodes_pool:
             return []
 
-        # RRF Calculation (k=60 is standard)
-        rrf_constant = 60
-        final_scores: dict[str, float] = {}
-
-        # Rank list 1: Hybrid/Vector scores
         sorted_hybrid = sorted(hybrid_scores.items(), key=lambda x: x[1], reverse=True)
-        for rank, (nid, _) in enumerate(sorted_hybrid):
-            final_scores[nid] = final_scores.get(nid, 0.0) + (1.0 / (rrf_constant + rank + 1))
-
-        # Rank list 2: Lexical scores
-        sorted_lexical = sorted(lexical_scores.items(), key=lambda x: x[1], reverse=True)
-        for rank, (nid, _) in enumerate(sorted_lexical):
-            final_scores[nid] = final_scores.get(nid, 0.0) + (1.0 / (rrf_constant + rank + 1))
-
-        # Select top candidates by RRF score
-        sorted_rrf = sorted(final_scores.items(), key=lambda x: x[1], reverse=True)
-        candidates = [nodes_pool[nid] for nid, _ in sorted_rrf[: self.candidate_cap]]
+        hybrid_ids = [nid for nid, _ in sorted_hybrid]
+        fused = reciprocal_rank_fusion(
+            [hybrid_ids, bm25_ids],
+            rrf_k=self.rrf_k,
+            weights=[self.rrf_vector_weight, self.rrf_bm25_weight],
+        )
+        final_scores = {nid: score for nid, score in fused}
+        candidate_ids = [nid for nid, _ in fused if nid in nodes_pool][: self.candidate_cap]
+        candidates = [nodes_pool[nid] for nid in candidate_ids]
 
         llm_ids = self._llm_rank(query, candidates, top_k) if self.use_llm else []
         final_nodes: list[dict]
@@ -388,12 +359,14 @@ class HybridRetriever:
             final_nodes = candidates[:top_k]
 
         hits: list[RetrievedHit] = []
+        max_fused_score = max((final_scores.get(str(n.get("id")), 0.0) for n in final_nodes), default=0.0)
         for idx, node in enumerate(final_nodes[:top_k]):
             if llm_ids:
                 denom = max(1, top_k - 1)
                 score = 1.0 if top_k == 1 else 1.0 - (idx / denom)
             else:
-                score = lexical_score(query, self._candidate_text(node))
+                fused_score = final_scores.get(str(node.get("id")), 0.0)
+                score = (fused_score / max_fused_score) if max_fused_score > 0 else 0.0
             score = max(0.0, min(score, 1.0))
             hits.append(
                 RetrievedHit(
@@ -442,11 +415,10 @@ def display_hits(console: Console, query: str, hits: list[RetrievedHit], top_k: 
 def main() -> None:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Retrieve from hybrid vector+PageIndex pipeline")
+    parser = argparse.ArgumentParser(description="Retrieve from hybrid summary-vector+PageIndex pipeline")
     parser.add_argument("--nodes-file", type=Path, default=DEFAULT_NODES_FILE, help="Path to pageindex nodes.jsonl")
     parser.add_argument("--chroma-dir", type=Path, default=DEFAULT_CHROMA_DIR, help="Chroma directory")
-    parser.add_argument("--collection", default=DEFAULT_COLLECTION, help="Chroma collection")
-    parser.add_argument("--chunks-file", type=Path, default=DEFAULT_CHUNKS_FILE, help="chunks.jsonl for chunk->node mapping")
+    parser.add_argument("--collection", default=DEFAULT_COLLECTION, help="Chroma collection with node-summary vectors")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Fallback base URL for embedding/LLM calls")
     parser.add_argument("--embed-base-url", default=DEFAULT_EMBED_BASE_URL, help="Embedding API URL")
     parser.add_argument("--llm-base-url", default=DEFAULT_LLM_BASE_URL, help="LLM API URL")
@@ -458,6 +430,10 @@ def main() -> None:
     parser.add_argument("--siblings-per-node", type=int, default=2, help="Sibling cap per expanded node")
     parser.add_argument("--final-summary-chars", type=int, default=420, help="Summary chars per candidate for hybrid final rerank")
     parser.add_argument("--final-text-chars", type=int, default=1500, help="Body excerpt chars per candidate for hybrid final rerank")
+    parser.add_argument("--bm25-top-n", type=int, default=DEFAULT_BM25_TOP_N, help="Global BM25 shortlist size before fusion")
+    parser.add_argument("--rrf-k", type=int, default=DEFAULT_RRF_K, help="RRF constant for vector(summary)/tree + BM25 fusion")
+    parser.add_argument("--rrf-vector-weight", type=float, default=1.0, help="RRF weight for vector(summary)/tree branch")
+    parser.add_argument("--rrf-bm25-weight", type=float, default=1.0, help="RRF weight for BM25 branch")
     parser.add_argument("--content-chars", type=int, default=500, help="Max chars to show per result content")
     parser.add_argument("--no-llm", action="store_true", help="Disable hybrid LLM rerank")
     parser.add_argument("query", nargs="*", help="One-shot query")
@@ -476,7 +452,6 @@ def main() -> None:
         model=args.model,
         chroma_dir=args.chroma_dir,
         collection=args.collection,
-        chunks_file=args.chunks_file,
         use_llm=not args.no_llm,
         vector_top_n=args.vector_top_n,
         candidate_cap=args.candidate_cap,
@@ -484,6 +459,10 @@ def main() -> None:
         siblings_per_node=args.siblings_per_node,
         summary_chars=args.final_summary_chars,
         text_chars=args.final_text_chars,
+        bm25_top_n=args.bm25_top_n,
+        rrf_k=args.rrf_k,
+        rrf_vector_weight=args.rrf_vector_weight,
+        rrf_bm25_weight=args.rrf_bm25_weight,
     )
 
     if args.query:

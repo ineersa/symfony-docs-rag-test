@@ -17,6 +17,7 @@ from rich.console import Console
 from rich.progress import Progress
 from rich.table import Table
 
+from bm25_common import BM25Index, reciprocal_rank_fusion
 from hybrid_retrieve import HybridRetriever
 from pageindex_common import TreeRetriever, load_nodes
 
@@ -29,16 +30,19 @@ DEFAULT_PAGEINDEX_BASE_URL = "http://localhost:8052/v1"
 DEFAULT_COLLECTION = "symfony_docs"
 DEFAULT_CHROMA_DIR = Path("data/chroma")
 DEFAULT_TOP_K = 5
+DEFAULT_LOCAL_VECTOR_CANDIDATES = 40
+DEFAULT_LOCAL_BM25_CANDIDATES = 40
+DEFAULT_LOCAL_RRF_K = 60
 DEFAULT_PAGEINDEX_NODES = Path("data/pageindex/nodes.jsonl")
 DEFAULT_PAGEINDEX_MODEL = "local-model"
 DEFAULT_HYBRID_BASE_URL = DEFAULT_BASE_URL
 DEFAULT_HYBRID_EMBED_BASE_URL = "http://localhost:8059/v1"
 DEFAULT_HYBRID_LLM_BASE_URL = "http://localhost:4321/v1"
+DEFAULT_HYBRID_COLLECTION = "symfony_pageindex_summaries"
 DEFAULT_HYBRID_VECTOR_TOP_N = 40
 DEFAULT_HYBRID_CANDIDATE_CAP = 30
 DEFAULT_HYBRID_NEIGHBOR_DEPTH = 1
 DEFAULT_HYBRID_SIBLINGS = 2
-DEFAULT_CHUNKS_FILE = Path("data/chunks.jsonl")
 
 QUERY_PREFIX = "Represent this query for searching relevant code: "
 
@@ -76,11 +80,43 @@ class Predictor:
 
 
 class LocalChromaPredictor(Predictor):
-    def __init__(self, base_url: str, chroma_dir: Path, collection: str):
+    def __init__(
+        self,
+        base_url: str,
+        chroma_dir: Path,
+        collection: str,
+        *,
+        vector_candidates: int,
+        bm25_candidates: int,
+        rrf_k: int,
+    ):
         super().__init__()
         self.client = OpenAI(base_url=base_url, api_key="not-needed")
+        self.vector_candidates = max(1, vector_candidates)
+        self.bm25_candidates = max(1, bm25_candidates)
+        self.rrf_k = max(1, rrf_k)
         chroma_client = chromadb.PersistentClient(path=str(chroma_dir))
         self.collection = chroma_client.get_collection(collection)
+
+        corpus = self.collection.get(include=["documents", "metadatas"])
+        self.corpus_ids = [str(x) for x in (corpus.get("ids") or [])]
+        self.corpus_docs = list(corpus.get("documents") or [])
+        self.corpus_metas = list(corpus.get("metadatas") or [])
+        self.id_to_row = {doc_id: idx for idx, doc_id in enumerate(self.corpus_ids)}
+
+        bm25_texts: list[str] = []
+        for doc, meta in zip(self.corpus_docs, self.corpus_metas):
+            m = dict(meta or {})
+            bm25_texts.append(
+                "\n".join(
+                    [
+                        str(m.get("source", "")),
+                        str(m.get("breadcrumb", "")),
+                        str(doc or ""),
+                    ]
+                ).strip()
+            )
+        self.bm25 = BM25Index(bm25_texts)
 
     def _embed_query(self, query: str) -> list[float]:
         enriched = query
@@ -95,19 +131,40 @@ class LocalChromaPredictor(Predictor):
         embedding = self._embed_query(query)
         result = self.collection.query(
             query_embeddings=[embedding],
-            n_results=top_k,
-            include=["metadatas", "distances"],
+            n_results=max(top_k, self.vector_candidates),
+            include=["metadatas", "distances", "documents"],
         )
 
-        ids = result["ids"][0]
+        ids_raw = result.get("ids") or [[]]
+        docs_raw = result.get("documents") or [[]]
         metadatas_raw = result.get("metadatas") or [[]]
         distances_raw = result.get("distances") or [[]]
+        ids = [str(x) for x in (ids_raw[0] if ids_raw else [])]
+        documents = docs_raw[0] if docs_raw else []
         metadatas = metadatas_raw[0] if metadatas_raw else []
         distances = distances_raw[0] if distances_raw else []
 
+        vector_by_id: dict[str, tuple[str, dict, float]] = {}
+        for hit_id, doc, meta, dist in zip(ids, documents, metadatas, distances):
+            vector_by_id[hit_id] = (str(doc or ""), dict(meta or {}), float(dist) if dist is not None else 1.0)
+
+        bm25_hits = self.bm25.search(query, self.bm25_candidates)
+        bm25_ids = [self.corpus_ids[h.index] for h in bm25_hits if 0 <= h.index < len(self.corpus_ids)]
+
+        fused = reciprocal_rank_fusion([ids, bm25_ids], rrf_k=self.rrf_k)
+        top_ids = [doc_id for doc_id, _ in fused[:top_k]]
+
         hits: list[Hit] = []
-        for hit_id, meta, dist in zip(ids, metadatas, distances):
-            meta = meta or {}
+        for hit_id in top_ids:
+            if hit_id in vector_by_id:
+                _, meta, dist = vector_by_id[hit_id]
+            else:
+                row = self.id_to_row.get(hit_id)
+                if row is None:
+                    continue
+                meta = dict(self.corpus_metas[row] or {})
+                dist = 0.99
+
             ls = meta.get("line_start")
             le = meta.get("line_end")
             hits.append(
@@ -235,7 +292,6 @@ class HybridPredictor(Predictor):
         model: str,
         chroma_dir: Path,
         collection: str,
-        chunks_file: Path,
         vector_top_n: int,
         candidate_cap: int,
         neighbor_depth: int,
@@ -243,6 +299,10 @@ class HybridPredictor(Predictor):
         no_llm: bool,
         summary_chars: int,
         text_chars: int,
+        bm25_top_n: int,
+        rrf_k: int,
+        rrf_vector_weight: float,
+        rrf_bm25_weight: float,
     ):
         super().__init__()
         if not nodes_file.is_file():
@@ -256,7 +316,6 @@ class HybridPredictor(Predictor):
             model=model,
             chroma_dir=chroma_dir,
             collection=collection,
-            chunks_file=chunks_file,
             use_llm=not no_llm,
             vector_top_n=vector_top_n,
             candidate_cap=candidate_cap,
@@ -264,6 +323,10 @@ class HybridPredictor(Predictor):
             siblings_per_node=siblings_per_node,
             summary_chars=summary_chars,
             text_chars=text_chars,
+            bm25_top_n=bm25_top_n,
+            rrf_k=rrf_k,
+            rrf_vector_weight=rrf_vector_weight,
+            rrf_bm25_weight=rrf_bm25_weight,
         )
 
     def predict(self, query: str, top_k: int) -> list[Hit]:
@@ -343,6 +406,9 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K, help="Maximum K to retrieve")
     parser.add_argument("--predictor", choices=["local", "api", "pageindex", "hybrid"], default="local", help="Predictor backend")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Embedding API URL for local predictor")
+    parser.add_argument("--local-vector-candidates", type=int, default=DEFAULT_LOCAL_VECTOR_CANDIDATES, help="Vector shortlist size before local RRF")
+    parser.add_argument("--local-bm25-candidates", type=int, default=DEFAULT_LOCAL_BM25_CANDIDATES, help="BM25 shortlist size before local RRF")
+    parser.add_argument("--local-rrf-k", type=int, default=DEFAULT_LOCAL_RRF_K, help="RRF constant for local predictor")
     parser.add_argument("--pageindex-base-url", default=DEFAULT_PAGEINDEX_BASE_URL, help="LLM API URL for PageIndex predictor")
     parser.add_argument("--collection", default=DEFAULT_COLLECTION, help="Chroma collection for local predictor")
     parser.add_argument("--chroma-dir", type=Path, default=DEFAULT_CHROMA_DIR, help="Chroma dir for local predictor")
@@ -363,13 +429,17 @@ def main() -> None:
     parser.add_argument("--hybrid-embed-base-url", default=DEFAULT_HYBRID_EMBED_BASE_URL, help="Embedding API URL for hybrid")
     parser.add_argument("--hybrid-llm-base-url", default=DEFAULT_HYBRID_LLM_BASE_URL, help="LLM API URL for hybrid")
     parser.add_argument("--hybrid-model", default=DEFAULT_PAGEINDEX_MODEL, help="Model name for hybrid LLM rerank")
+    parser.add_argument("--hybrid-collection", default=DEFAULT_HYBRID_COLLECTION, help="Chroma collection with hybrid node-summary vectors")
     parser.add_argument("--hybrid-vector-top-n", type=int, default=DEFAULT_HYBRID_VECTOR_TOP_N, help="Vector shortlist size for hybrid")
     parser.add_argument("--hybrid-candidate-cap", type=int, default=DEFAULT_HYBRID_CANDIDATE_CAP, help="Max candidates kept before final hybrid rerank")
     parser.add_argument("--hybrid-neighbor-depth", type=int, default=DEFAULT_HYBRID_NEIGHBOR_DEPTH, help="Neighbor expansion depth for hybrid")
     parser.add_argument("--hybrid-siblings-per-node", type=int, default=DEFAULT_HYBRID_SIBLINGS, help="Sibling cap per expanded node in hybrid")
-    parser.add_argument("--hybrid-no-llm", action="store_true", help="Disable hybrid LLM rerank and use evidence+lexical fallback")
+    parser.add_argument("--hybrid-no-llm", action="store_true", help="Disable hybrid LLM rerank and use fused rank fallback")
     parser.add_argument("--hybrid-nodes", type=Path, default=DEFAULT_PAGEINDEX_NODES, help="Nodes JSONL for hybrid retrieval")
-    parser.add_argument("--hybrid-chunks", type=Path, default=DEFAULT_CHUNKS_FILE, help="Chunks JSONL for hybrid chunk->node mapping")
+    parser.add_argument("--hybrid-bm25-top-n", type=int, default=80, help="Global BM25 shortlist size for hybrid RRF")
+    parser.add_argument("--hybrid-rrf-k", type=int, default=60, help="RRF constant for hybrid vector(summary)/tree + BM25 fusion")
+    parser.add_argument("--hybrid-rrf-vector-weight", type=float, default=1.0, help="RRF weight for hybrid vector(summary)/tree branch")
+    parser.add_argument("--hybrid-rrf-bm25-weight", type=float, default=1.0, help="RRF weight for hybrid BM25 branch")
     parser.add_argument("--limit", type=int, default=0, help="Limit number of benchmark questions")
     parser.add_argument("--sample-size", type=int, default=0, help="Randomly sample N questions (0 = all)")
     parser.add_argument("--sample-seed", type=int, default=42, help="Seed for random sampling")
@@ -389,7 +459,14 @@ def main() -> None:
         raise SystemExit("No benchmark questions to evaluate")
 
     if args.predictor == "local":
-        predictor: Predictor = LocalChromaPredictor(args.base_url, args.chroma_dir, args.collection)
+        predictor = LocalChromaPredictor(
+            args.base_url,
+            args.chroma_dir,
+            args.collection,
+            vector_candidates=args.local_vector_candidates,
+            bm25_candidates=args.local_bm25_candidates,
+            rrf_k=args.local_rrf_k,
+        )
     elif args.predictor == "api":
         if not args.api_endpoint:
             raise SystemExit("--api-endpoint is required for --predictor api")
@@ -418,8 +495,7 @@ def main() -> None:
             llm_base_url=args.hybrid_llm_base_url,
             model=args.hybrid_model,
             chroma_dir=args.chroma_dir,
-            collection=args.collection,
-            chunks_file=args.hybrid_chunks,
+            collection=args.hybrid_collection,
             vector_top_n=args.hybrid_vector_top_n,
             candidate_cap=args.hybrid_candidate_cap,
             neighbor_depth=args.hybrid_neighbor_depth,
@@ -427,6 +503,10 @@ def main() -> None:
             no_llm=args.hybrid_no_llm,
             summary_chars=args.pageindex_final_summary_chars,
             text_chars=args.pageindex_final_text_chars,
+            bm25_top_n=args.hybrid_bm25_top_n,
+            rrf_k=args.hybrid_rrf_k,
+            rrf_vector_weight=args.hybrid_rrf_vector_weight,
+            rrf_bm25_weight=args.hybrid_rrf_bm25_weight,
         )
 
     modes = ["strict", "relaxed"] if args.mode == "both" else [args.mode]

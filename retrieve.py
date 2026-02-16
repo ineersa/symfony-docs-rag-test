@@ -17,10 +17,15 @@ from rich.text import Text
 from rich.table import Table
 from rich import box
 
+from bm25_common import BM25Index, reciprocal_rank_fusion
+
 # ── Defaults ───────────────────────────────────────────────────────
 DEFAULT_BASE_URL = "http://localhost:8059/v1"
 DEFAULT_COLLECTION = "symfony_docs"
 DEFAULT_TOP_K = 5
+DEFAULT_VECTOR_CANDIDATES = 40
+DEFAULT_BM25_CANDIDATES = 40
+DEFAULT_RRF_K = 60
 CHROMA_DIR = Path("data/chroma")
 
 # CodeRankEmbed bi-encoder: queries need this prefix
@@ -94,6 +99,9 @@ def main():
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="Embeddings API base URL")
     parser.add_argument("--collection", default=DEFAULT_COLLECTION, help="ChromaDB collection name")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K, help="Number of results to return")
+    parser.add_argument("--vector-candidates", type=int, default=DEFAULT_VECTOR_CANDIDATES, help="Vector shortlist size before RRF")
+    parser.add_argument("--bm25-candidates", type=int, default=DEFAULT_BM25_CANDIDATES, help="BM25 shortlist size before RRF")
+    parser.add_argument("--rrf-k", type=int, default=DEFAULT_RRF_K, help="RRF constant")
     parser.add_argument("--chroma-dir", type=Path, default=CHROMA_DIR, help="ChromaDB storage directory")
     parser.add_argument("query", nargs="*", help="One-shot query (skip REPL)")
     args = parser.parse_args()
@@ -115,6 +123,26 @@ def main():
     doc_count = collection.count()
     console.print(f"[bold]Loaded collection[/] '{args.collection}' with [cyan]{doc_count}[/] documents")
 
+    corpus = collection.get(include=["documents", "metadatas"])
+    corpus_ids = [str(x) for x in (corpus.get("ids") or [])]
+    corpus_docs = list(corpus.get("documents") or [])
+    corpus_metas = list(corpus.get("metadatas") or [])
+    id_to_row = {doc_id: idx for idx, doc_id in enumerate(corpus_ids)}
+
+    bm25_texts: list[str] = []
+    for doc, meta in zip(corpus_docs, corpus_metas):
+        m = dict(meta or {})
+        bm25_texts.append(
+            "\n".join(
+                [
+                    str(m.get("source", "")),
+                    str(m.get("breadcrumb", "")),
+                    str(doc or ""),
+                ]
+            ).strip()
+        )
+    bm25_index = BM25Index(bm25_texts)
+
     # Setup embeddings client
     client = OpenAI(base_url=args.base_url, api_key="not-needed")
 
@@ -122,11 +150,52 @@ def main():
     if args.query:
         query = " ".join(args.query)
         query_embedding = embed_query(client, query)
-        results = collection.query(
+        vector_results = collection.query(
             query_embeddings=[query_embedding],
-            n_results=args.top_k,
+            n_results=max(args.top_k, args.vector_candidates),
             include=["documents", "metadatas", "distances"],
         )
+        ids_raw = vector_results.get("ids") or [[]]
+        docs_raw = vector_results.get("documents") or [[]]
+        metas_raw = vector_results.get("metadatas") or [[]]
+        dists_raw = vector_results.get("distances") or [[]]
+        vector_ids = [str(x) for x in (ids_raw[0] if ids_raw else [])]
+        vector_docs = docs_raw[0] if docs_raw else []
+        vector_metas = metas_raw[0] if metas_raw else []
+        vector_distances = dists_raw[0] if dists_raw else []
+
+        vector_by_id: dict[str, tuple[str, dict, float]] = {}
+        for doc_id, doc, meta, dist in zip(vector_ids, vector_docs, vector_metas, vector_distances):
+            vector_by_id[doc_id] = (str(doc or ""), dict(meta or {}), float(dist) if dist is not None else 1.0)
+
+        bm25_hits = bm25_index.search(query, args.bm25_candidates)
+        bm25_ids = [corpus_ids[h.index] for h in bm25_hits if 0 <= h.index < len(corpus_ids)]
+
+        fused = reciprocal_rank_fusion([vector_ids, bm25_ids], rrf_k=args.rrf_k)
+        top_ids = [doc_id for doc_id, _ in fused[: args.top_k]]
+
+        out_docs: list[str] = []
+        out_metas: list[dict] = []
+        out_distances: list[float] = []
+        for doc_id in top_ids:
+            if doc_id in vector_by_id:
+                doc, meta, dist = vector_by_id[doc_id]
+                out_docs.append(doc)
+                out_metas.append(meta)
+                out_distances.append(dist)
+                continue
+            idx = id_to_row[doc_id]
+            meta = dict(corpus_metas[idx] or {})
+            out_docs.append(str(corpus_docs[idx] or ""))
+            out_metas.append(meta)
+            out_distances.append(0.99)
+
+        results = {
+            "ids": [top_ids],
+            "documents": [out_docs],
+            "metadatas": [out_metas],
+            "distances": [out_distances],
+        }
         display_results(console, query, results, args.top_k)
         return
 
@@ -168,11 +237,51 @@ def main():
         # Query
         try:
             query_embedding = embed_query(client, query)
-            results = collection.query(
+            vector_results = collection.query(
                 query_embeddings=[query_embedding],
-                n_results=top_k,
+                n_results=max(top_k, args.vector_candidates),
                 include=["documents", "metadatas", "distances"],
             )
+            ids_raw = vector_results.get("ids") or [[]]
+            docs_raw = vector_results.get("documents") or [[]]
+            metas_raw = vector_results.get("metadatas") or [[]]
+            dists_raw = vector_results.get("distances") or [[]]
+            vector_ids = [str(x) for x in (ids_raw[0] if ids_raw else [])]
+            vector_docs = docs_raw[0] if docs_raw else []
+            vector_metas = metas_raw[0] if metas_raw else []
+            vector_distances = dists_raw[0] if dists_raw else []
+
+            vector_by_id: dict[str, tuple[str, dict, float]] = {}
+            for doc_id, doc, meta, dist in zip(vector_ids, vector_docs, vector_metas, vector_distances):
+                vector_by_id[doc_id] = (str(doc or ""), dict(meta or {}), float(dist) if dist is not None else 1.0)
+
+            bm25_hits = bm25_index.search(query, args.bm25_candidates)
+            bm25_ids = [corpus_ids[h.index] for h in bm25_hits if 0 <= h.index < len(corpus_ids)]
+
+            fused = reciprocal_rank_fusion([vector_ids, bm25_ids], rrf_k=args.rrf_k)
+            top_ids = [doc_id for doc_id, _ in fused[:top_k]]
+
+            out_docs: list[str] = []
+            out_metas: list[dict] = []
+            out_distances: list[float] = []
+            for doc_id in top_ids:
+                if doc_id in vector_by_id:
+                    doc, meta, dist = vector_by_id[doc_id]
+                    out_docs.append(doc)
+                    out_metas.append(meta)
+                    out_distances.append(dist)
+                    continue
+                idx = id_to_row[doc_id]
+                out_docs.append(str(corpus_docs[idx] or ""))
+                out_metas.append(dict(corpus_metas[idx] or {}))
+                out_distances.append(0.99)
+
+            results = {
+                "ids": [top_ids],
+                "documents": [out_docs],
+                "metadatas": [out_metas],
+                "distances": [out_distances],
+            }
             display_results(console, query, results, top_k)
         except Exception as e:
             console.print(f"[red]Error:[/] {e}")

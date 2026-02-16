@@ -21,6 +21,7 @@ uv run python embed.py --base-url http://localhost:8059/v1 --reset
 ### Retrieve Manually
 
 ```bash
+# Uses dense vector + BM25 with RRF fusion
 uv run python retrieve.py --base-url http://localhost:8059/v1
 ```
 
@@ -44,7 +45,7 @@ Output: `data/benchmark/questions.jsonl`
 ### Run Benchmark
 
 ```bash
-# Run both strict and relaxed scoring
+# Run both strict and relaxed scoring (local predictor now uses vector+BM25+RRF)
 uv run python benchmark_run.py --mode both --base-url http://localhost:8059/v1
 
 # Faster iteration: run on a random subset (e.g. 200 questions)

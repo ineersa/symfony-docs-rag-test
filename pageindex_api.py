@@ -18,7 +18,7 @@ from pageindex_common import TreeRetriever, load_nodes
 DEFAULT_BASE_URL = "http://localhost:8052/v1"
 DEFAULT_MODEL = "local-model"
 DEFAULT_NODES_FILE = Path("data/pageindex/nodes.jsonl")
-DEFAULT_CHUNKS_FILE = Path("data/chunks.jsonl")
+DEFAULT_HYBRID_COLLECTION = "symfony_pageindex_summaries"
 DEFAULT_HYBRID_EMBED_BASE_URL = "http://localhost:8059/v1"
 DEFAULT_HYBRID_LLM_BASE_URL = "http://localhost:4321/v1"
 
@@ -105,9 +105,8 @@ def main() -> None:
     parser.add_argument("--final-summary-chars", type=int, default=420, help="Summary chars per candidate in final ranking")
     parser.add_argument("--step-text-chars", type=int, default=900, help="Body excerpt chars per candidate in traversal")
     parser.add_argument("--final-text-chars", type=int, default=1500, help="Body excerpt chars per candidate in final ranking")
-    parser.add_argument("--collection", default="symfony_docs", help="Chroma collection for hybrid mode")
+    parser.add_argument("--hybrid-collection", default=DEFAULT_HYBRID_COLLECTION, help="Chroma collection with hybrid node-summary vectors")
     parser.add_argument("--chroma-dir", type=Path, default=Path("data/chroma"), help="Chroma dir for hybrid mode")
-    parser.add_argument("--chunks-file", type=Path, default=DEFAULT_CHUNKS_FILE, help="chunks.jsonl for hybrid mapping")
     parser.add_argument("--hybrid-vector-top-n", type=int, default=40, help="Vector shortlist size in hybrid mode")
     parser.add_argument("--hybrid-candidate-cap", type=int, default=30, help="Candidate cap before rerank in hybrid mode")
     parser.add_argument("--hybrid-neighbor-depth", type=int, default=1, help="Neighbor expansion depth in hybrid mode")
@@ -116,6 +115,10 @@ def main() -> None:
     parser.add_argument("--hybrid-llm-base-url", default=DEFAULT_HYBRID_LLM_BASE_URL, help="LLM API URL for hybrid mode")
     parser.add_argument("--hybrid-final-summary-chars", type=int, default=420, help="Summary chars per candidate in hybrid final rerank")
     parser.add_argument("--hybrid-final-text-chars", type=int, default=1500, help="Body excerpt chars per candidate in hybrid final rerank")
+    parser.add_argument("--hybrid-bm25-top-n", type=int, default=80, help="Global BM25 shortlist size before hybrid fusion")
+    parser.add_argument("--hybrid-rrf-k", type=int, default=60, help="RRF constant for hybrid vector(summary)/tree + BM25 fusion")
+    parser.add_argument("--hybrid-rrf-vector-weight", type=float, default=1.0, help="RRF weight for hybrid vector(summary)/tree branch")
+    parser.add_argument("--hybrid-rrf-bm25-weight", type=float, default=1.0, help="RRF weight for hybrid BM25 branch")
     parser.add_argument("--hybrid-no-llm", action="store_true", help="Disable hybrid LLM rerank")
     args = parser.parse_args()
 
@@ -149,8 +152,7 @@ def main() -> None:
             llm_base_url=args.hybrid_llm_base_url,
             model=args.model,
             chroma_dir=args.chroma_dir,
-            collection=args.collection,
-            chunks_file=args.chunks_file,
+            collection=args.hybrid_collection,
             use_llm=not args.hybrid_no_llm,
             vector_top_n=args.hybrid_vector_top_n,
             candidate_cap=args.hybrid_candidate_cap,
@@ -158,6 +160,10 @@ def main() -> None:
             siblings_per_node=args.hybrid_siblings_per_node,
             summary_chars=args.hybrid_final_summary_chars,
             text_chars=args.hybrid_final_text_chars,
+            bm25_top_n=args.hybrid_bm25_top_n,
+            rrf_k=args.hybrid_rrf_k,
+            rrf_vector_weight=args.hybrid_rrf_vector_weight,
+            rrf_bm25_weight=args.hybrid_rrf_bm25_weight,
         )
 
         def retrieve_fn(query: str, top_k: int):

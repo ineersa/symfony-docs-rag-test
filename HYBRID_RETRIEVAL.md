@@ -7,7 +7,7 @@ The Hybrid Retrieval system in `simple-rag` combines the strengths of dense vect
 This approach addresses common RAG failure modes where:
 
 1.  Vector search retrieves relevant snippets but misses the broader context (parent sections).
-2.  Keywords are important but semantically "far" in vector space (fixed by lexical scoring).
+2.  Keywords are important but semantically "far" in vector space (fixed by BM25 scoring).
 3.  The "best" answer is adjacent to the vector hit (fixed by neighbor expansion).
 
 ## Logic Flow
@@ -27,10 +27,9 @@ The retrieval process follows a multi-stage pipeline:
     - Top matching _files_ are also injected to ensure coverage of highly relevant documents even if specific section chunks were missed.
 
 3.  **Reciprocal Rank Fusion (RRF)**:
-    - A **Lexical Score** is calculated for all candidates using token overlap (recall-weighted Jaccard) on title + summary + text.
-    - It applies light stemming and stopword removal to ensure robust keyword matching.
-    * The **Vector-Expanded Score** and **Lexical Score** are combined using RRF (`k=60`).
-    * This ensures that a node must ideally be both semantically similar (vector) and keyword-relevant (lexical) to rank highly.
+    - A **BM25 Score** is calculated globally over node text (title + summary + text).
+    * The **Vector-Expanded rank list** and **BM25 rank list** are combined using RRF (`k=60`).
+    * This ensures that a node must ideally be both semantically similar (vector) and keyword-relevant (BM25) to rank highly.
 
 4.  **LLM Reranking (Optional)**:
     - The top `candidate_cap` nodes after RRF are sent to a local LLM.
