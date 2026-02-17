@@ -5,6 +5,7 @@ import argparse
 import json
 import math
 import random
+import re
 import statistics
 import time
 import urllib.error
@@ -564,8 +565,18 @@ def question_sources(question: dict, source_aliases: dict[str, set[str]]) -> set
 
 
 def _normalize_for_quote_match(text: str) -> str:
-    collapsed = " ".join((text or "").split())
-    return collapsed.replace("`", "").replace("``", "").strip().lower()
+    normalized = " ".join((text or "").split())
+
+    # Normalize reStructuredText inline links to plain text form used in chunks:
+    #   `Label <https://example.test>`_ -> Label (https://example.test)
+    normalized = re.sub(r"`([^`<>]+?)\s*<([^>]+)>`_", r"\1 (\2)", normalized)
+    normalized = re.sub(r"([^`<>\n]+?)\s*<([^>]+)>_", r"\1 (\2)", normalized)
+
+    # Normalize common role/literal markup wrappers.
+    normalized = re.sub(r":[a-zA-Z0-9_:+-]+:`([^`]+)`", r"\1", normalized)
+    normalized = normalized.replace("``", "").replace("`", "")
+
+    return normalized.strip().lower()
 
 
 def quote_match(question: dict, hit: Hit) -> bool:

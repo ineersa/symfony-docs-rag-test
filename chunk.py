@@ -42,7 +42,7 @@ for _role_name in _SPHINX_ROLES:
 
 # Register common Sphinx directives as no-ops (parsed as comments)
 _SPHINX_DIRECTIVES = [
-    "toctree", "versionadded", "versionchanged", "deprecated",
+    "versionadded", "versionchanged", "deprecated",
     "seealso", "todo", "index", "glossary", "only",
     "best-practice", "screencast",
     "sidebar", "rst-class", "caution",
@@ -66,8 +66,63 @@ class _NoOpDirective(Directive):
         return []
 
 
+class _ToctreeDirective(Directive):
+    """Preserve toctree options + entries as retrievable literal text."""
+
+    required_arguments = 0
+    optional_arguments = 0
+    final_argument_whitespace = False
+    has_content = True
+    option_spec = {
+        "maxdepth": directives.nonnegative_int,
+        "titlesonly": directives.flag,
+        "caption": directives.unchanged_required,
+        "glob": directives.flag,
+        "hidden": directives.flag,
+        "includehidden": directives.flag,
+        "numbered": directives.unchanged,
+        "reversed": directives.flag,
+    }
+
+    def run(self):
+        parts: list[str] = [".. toctree::"]
+
+        if "maxdepth" in self.options:
+            parts.append(f":maxdepth: {self.options['maxdepth']}")
+        if "titlesonly" in self.options:
+            parts.append(":titlesonly:")
+        if "caption" in self.options:
+            parts.append(f":caption: {self.options['caption']}")
+        if "glob" in self.options:
+            parts.append(":glob:")
+        if "hidden" in self.options:
+            parts.append(":hidden:")
+        if "includehidden" in self.options:
+            parts.append(":includehidden:")
+        if "numbered" in self.options:
+            numbered = self.options.get("numbered")
+            if numbered in (None, ""):
+                parts.append(":numbered:")
+            else:
+                parts.append(f":numbered: {numbered}")
+        if "reversed" in self.options:
+            parts.append(":reversed:")
+
+        if self.content:
+            parts.append("")
+            for line in self.content:
+                parts.append(line)
+
+        text = "\n".join(parts).strip()
+        if not text:
+            return []
+        return [nodes.literal_block(text, text)]
+
+
 for _dir_name in _SPHINX_DIRECTIVES:
     directives.register_directive(_dir_name, _NoOpDirective)
+
+directives.register_directive("toctree", _ToctreeDirective)
 
 
 # ── configuration-block: split nested code-blocks by language ──────

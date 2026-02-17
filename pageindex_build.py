@@ -19,6 +19,7 @@ from openai import AsyncOpenAI
 from rich.progress import BarColumn, Progress, TaskID, TextColumn, TimeElapsedColumn, TimeRemainingColumn
 
 from chunk import DOCS_DIR, collect_rst_files, extract_section_content, node_line_range, resolve_includes
+from pageindex_linefix import repair_tree_line_ranges
 
 OUTPUT_DIR = Path("data/pageindex")
 TREE_FILE = OUTPUT_DIR / "tree.json"
@@ -375,6 +376,15 @@ def attach_file_hierarchy(file_roots: dict[str, dict], parent_map: dict[str, str
     return synthetic_root
 
 
+def build_source_line_counts(files: list[Path], docs_dir: Path) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for file_path in files:
+        rel = str(file_path.relative_to(docs_dir)).replace("\\", "/")
+        raw = file_path.read_text(encoding="utf-8", errors="replace")
+        counts[rel] = len(raw.splitlines())
+    return counts
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build PageIndex-style tree index from RST docs")
     parser.add_argument("--docs-dir", type=Path, default=DOCS_DIR, help="Docs root directory")
@@ -404,6 +414,7 @@ def main() -> None:
 
     docs_root = args.docs_dir.resolve()
     files = collect_rst_files(args.docs_dir)
+    source_line_counts = build_source_line_counts(files, args.docs_dir)
 
     file_roots: dict[str, dict] = {}
     parent_map: dict[str, str | None] = {}
@@ -433,6 +444,7 @@ def main() -> None:
             progress.advance(parse_task)
 
         full_tree = attach_file_hierarchy(file_roots, parent_map)
+        repair_tree_line_ranges(full_tree, source_line_counts=source_line_counts)
 
         flat_nodes: list[dict] = []
         flatten_tree(full_tree, parent_id=None, depth=0, out=flat_nodes)
