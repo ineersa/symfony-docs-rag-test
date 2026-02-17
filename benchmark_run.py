@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 import random
 import statistics
 import time
@@ -41,6 +42,8 @@ from rerank_common import (
 DEFAULT_QUESTIONS = Path("data/benchmark/questions.jsonl")
 DEFAULT_RESULTS = Path("data/benchmark/results.json")
 DEFAULT_RESULTS_JSONL = Path("data/benchmark/results.jsonl")
+DEFAULT_HARD_SET_DIR = Path("data/benchmark/hard_sets")
+DEFAULT_SOURCE_ALIASES = Path("data/benchmark/source_aliases.json")
 
 DEFAULT_BASE_URL = "http://localhost:8059/v1"
 DEFAULT_PAGEINDEX_BASE_URL = "http://localhost:8052/v1"
@@ -82,6 +85,7 @@ class Hit:
     line_start: int | None
     line_end: int | None
     distance: float | None
+    text: str = ""
 
 
 class Predictor:
@@ -281,6 +285,7 @@ class LocalChromaPredictor(Predictor):
                     line_start=int(ls) if isinstance(ls, (int, float, str)) and str(ls).isdigit() else None,
                     line_end=int(le) if isinstance(le, (int, float, str)) and str(le).isdigit() else None,
                     distance=float(dist) if dist is not None else None,
+                    text=str(candidate.get("doc", "") or ""),
                 )
             )
         self._set_usage(
@@ -328,6 +333,7 @@ class ApiPredictor(Predictor):
                     line_start=item.get("line_start"),
                     line_end=item.get("line_end"),
                     distance=item.get("distance"),
+                    text=str(item.get("text", "") or ""),
                 )
             )
         self._set_usage(latency_ms=(time.perf_counter() - started) * 1000)
@@ -387,6 +393,7 @@ class LocalPageIndexPredictor(Predictor):
                 line_start=h.line_start,
                 line_end=h.line_end,
                 distance=h.distance,
+                text=h.text,
             )
             for h in raw_hits
         ]
@@ -480,6 +487,7 @@ class HybridPredictor(Predictor):
                 line_start=h.line_start,
                 line_end=h.line_end,
                 distance=h.distance,
+                text=h.text,
             )
             for h in raw_hits
         ]
@@ -495,13 +503,101 @@ def load_questions(path: Path) -> list[dict]:
     return out
 
 
+def load_source_aliases(path: Path) -> dict[str, set[str]]:
+    with open(path, encoding="utf-8") as f:
+        payload = json.load(f)
+
+    pairs: list[tuple[str, str]] = []
+    if isinstance(payload, dict):
+        for source, aliases in payload.items():
+            if not isinstance(source, str):
+                continue
+            if not isinstance(aliases, list):
+                continue
+            for alias in aliases:
+                if isinstance(alias, str):
+                    pairs.append((source, alias))
+    elif isinstance(payload, list):
+        for item in payload:
+            if not isinstance(item, list) or len(item) != 2:
+                continue
+            a, b = item
+            if isinstance(a, str) and isinstance(b, str):
+                pairs.append((a, b))
+
+    graph: dict[str, set[str]] = {}
+    for left, right in pairs:
+        if left == right:
+            continue
+        graph.setdefault(left, set()).add(right)
+        graph.setdefault(right, set()).add(left)
+
+    components: dict[str, set[str]] = {}
+    visited: set[str] = set()
+    for node in graph:
+        if node in visited:
+            continue
+        stack = [node]
+        comp: set[str] = set()
+        while stack:
+            cur = stack.pop()
+            if cur in visited:
+                continue
+            visited.add(cur)
+            comp.add(cur)
+            for nxt in graph.get(cur, set()):
+                if nxt not in visited:
+                    stack.append(nxt)
+        for member in comp:
+            components[member] = set(comp)
+
+    return components
+
+
+def question_sources(question: dict, source_aliases: dict[str, set[str]]) -> set[str]:
+    source = question.get("source_file")
+    if not isinstance(source, str) or not source:
+        return set()
+    equivalent = set(source_aliases.get(source, set()))
+    equivalent.add(source)
+    return equivalent
+
+
+def _normalize_for_quote_match(text: str) -> str:
+    collapsed = " ".join((text or "").split())
+    return collapsed.replace("`", "").replace("``", "").strip().lower()
+
+
+def quote_match(question: dict, hit: Hit) -> bool:
+    quote = question.get("answer_quote")
+    if not isinstance(quote, str) or not quote.strip():
+        return False
+    if not hit.text:
+        return False
+    return _normalize_for_quote_match(quote) in _normalize_for_quote_match(hit.text)
+
+
 def ranges_overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> bool:
     return max(a_start, b_start) <= min(a_end, b_end)
 
 
-def strict_match(question: dict, hit: Hit) -> bool:
-    if hit.source != question.get("source_file"):
+def strict_match(question: dict, hit: Hit, source_aliases: dict[str, set[str]]) -> bool:
+    source = question.get("source_file")
+    if not isinstance(source, str):
         return False
+    allowed_sources = question_sources(question, source_aliases)
+    if hit.source not in allowed_sources:
+        return False
+
+    # Keep canonical source line-aware; for alias sources allow source-level strict match.
+    if hit.source != source:
+        return True
+
+    # Quote fallback: if a canonical-source hit contains the answer quote,
+    # accept as strict even when line metadata drift exists.
+    if quote_match(question, hit):
+        return True
+
     qs = question.get("answer_line_start")
     qe = question.get("answer_line_end")
     if not isinstance(qs, int) or not isinstance(qe, int):
@@ -511,17 +607,52 @@ def strict_match(question: dict, hit: Hit) -> bool:
     return ranges_overlap(qs, qe, hit.line_start, hit.line_end)
 
 
-def relaxed_match(question: dict, hit: Hit) -> bool:
-    return hit.source == question.get("source_file")
+def relaxed_match(question: dict, hit: Hit, source_aliases: dict[str, set[str]]) -> bool:
+    return hit.source in question_sources(question, source_aliases)
 
 
-def hit_at_k(question: dict, hits: list[Hit], k: int, mode: str) -> bool:
+def hit_at_k(question: dict, hits: list[Hit], k: int, mode: str, source_aliases: dict[str, set[str]]) -> bool:
     subset = hits[:k]
     if mode == "strict":
-        return any(strict_match(question, h) for h in subset)
+        return any(strict_match(question, h, source_aliases) for h in subset)
     if mode == "relaxed":
-        return any(relaxed_match(question, h) for h in subset)
+        return any(relaxed_match(question, h, source_aliases) for h in subset)
     raise ValueError(f"Unsupported mode: {mode}")
+
+
+def _is_match(question: dict, hit: Hit, mode: str, source_aliases: dict[str, set[str]]) -> bool:
+    if mode == "strict":
+        return strict_match(question, hit, source_aliases)
+    if mode == "relaxed":
+        return relaxed_match(question, hit, source_aliases)
+    raise ValueError(f"Unsupported mode: {mode}")
+
+
+def mrr_at_k(question: dict, hits: list[Hit], k: int, mode: str, source_aliases: dict[str, set[str]]) -> float:
+    for idx, hit in enumerate(hits[:k], start=1):
+        if _is_match(question, hit, mode, source_aliases):
+            return 1.0 / idx
+    return 0.0
+
+
+def ndcg_at_k(question: dict, hits: list[Hit], k: int, mode: str, source_aliases: dict[str, set[str]]) -> float:
+    relevance = [1 if _is_match(question, hit, mode, source_aliases) else 0 for hit in hits[:k]]
+    if not relevance:
+        return 0.0
+
+    dcg = 0.0
+    for idx, rel in enumerate(relevance, start=1):
+        if rel:
+            dcg += 1.0 / math.log2(idx + 1)
+
+    ideal = sorted(relevance, reverse=True)
+    idcg = 0.0
+    for idx, rel in enumerate(ideal, start=1):
+        if rel:
+            idcg += 1.0 / math.log2(idx + 1)
+    if idcg == 0.0:
+        return 0.0
+    return dcg / idcg
 
 
 def score_percent(numer: int, denom: int) -> float:
@@ -533,8 +664,15 @@ def score_percent(numer: int, denom: int) -> float:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run benchmark scoring for retrieval")
     parser.add_argument("--questions", type=Path, default=DEFAULT_QUESTIONS, help="Input questions JSONL")
+    parser.add_argument(
+        "--source-aliases",
+        type=Path,
+        default=DEFAULT_SOURCE_ALIASES,
+        help="Optional JSON source alias mapping for multi-gold scoring",
+    )
     parser.add_argument("--results", type=Path, default=DEFAULT_RESULTS, help="Summary JSON output path")
     parser.add_argument("--results-jsonl", type=Path, default=DEFAULT_RESULTS_JSONL, help="Per-question JSONL output path")
+    parser.add_argument("--hard-set-dir", type=Path, default=DEFAULT_HARD_SET_DIR, help="Output directory for hard-set JSONL slices")
     parser.add_argument("--mode", choices=["strict", "relaxed", "both"], default="both", help="Scoring mode")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K, help="Maximum K to retrieve")
     parser.add_argument("--predictor", choices=["local", "api", "pageindex", "hybrid"], default="local", help="Predictor backend")
@@ -605,6 +743,10 @@ def main() -> None:
     console = Console()
     if not args.questions.is_file():
         raise SystemExit(f"Questions file not found: {args.questions}")
+
+    source_aliases: dict[str, set[str]] = {}
+    if args.source_aliases and args.source_aliases.is_file():
+        source_aliases = load_source_aliases(args.source_aliases)
 
     questions = load_questions(args.questions)
     if args.limit > 0:
@@ -691,6 +833,7 @@ def main() -> None:
 
     args.results.parent.mkdir(parents=True, exist_ok=True)
     args.results_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    args.hard_set_dir.mkdir(parents=True, exist_ok=True)
 
     per_question: list[dict] = []
     latency_ms_values: list[float] = []
@@ -698,17 +841,33 @@ def main() -> None:
     prompt_tokens_values: list[int] = []
     completion_tokens_values: list[int] = []
     total_tokens_values: list[int] = []
+    ranking_values_by_mode: dict[str, dict[str, list[float]]] = {
+        mode: {"mrr": [], "ndcg": []} for mode in modes
+    }
     with Progress(console=console) as progress:
         task = progress.add_task("Benchmarking...", total=len(questions))
         for q in questions:
             progress.advance(task)
             query = q["question"]
             hits = predictor.predict(query, args.top_k)
+            hard_k = min(5, args.top_k)
 
             metrics: dict[str, bool] = {}
+            ranking_metrics: dict[str, float] = {}
+            hard_set_flags: dict[str, bool] = {}
             for mode in modes:
-                metrics[f"{mode}_hit@1"] = hit_at_k(q, hits, 1, mode)
-                metrics[f"{mode}_hit@5"] = hit_at_k(q, hits, min(5, args.top_k), mode)
+                hit1 = hit_at_k(q, hits, 1, mode, source_aliases)
+                hit5 = hit_at_k(q, hits, hard_k, mode, source_aliases)
+                mrr = mrr_at_k(q, hits, args.top_k, mode, source_aliases)
+                ndcg = ndcg_at_k(q, hits, args.top_k, mode, source_aliases)
+                metrics[f"{mode}_hit@1"] = hit1
+                metrics[f"{mode}_hit@5"] = hit5
+                ranking_metrics[f"{mode}_mrr@{args.top_k}"] = round(mrr, 6)
+                ranking_metrics[f"{mode}_ndcg@{args.top_k}"] = round(ndcg, 6)
+                hard_set_flags[f"{mode}_top5_not_top1"] = (hit5 and not hit1)
+                hard_set_flags[f"{mode}_miss_top5"] = (not hit5)
+                ranking_values_by_mode[mode]["mrr"].append(mrr)
+                ranking_values_by_mode[mode]["ndcg"].append(ndcg)
 
             record = {
                 "id": q.get("id"),
@@ -719,6 +878,8 @@ def main() -> None:
                 "kind": q.get("kind"),
                 "difficulty": q.get("difficulty"),
                 "metrics": metrics,
+                "ranking_metrics": ranking_metrics,
+                "hard_set_flags": hard_set_flags,
                 "top_hits": [
                     {
                         "id": h.id,
@@ -745,16 +906,35 @@ def main() -> None:
             total_tokens_values.append(int(predictor.last_usage.get("total_tokens", 0) or 0))
 
     summary: dict[str, dict] = {}
+    hard_sets: dict[str, dict[str, list[dict]]] = {
+        mode: {"top5_not_top1": [], "miss_top5": []} for mode in modes
+    }
     total = len(per_question)
+    hard_k = min(5, args.top_k)
+    mrr_metric_key = f"mrr@{args.top_k}"
+    ndcg_metric_key = f"ndcg@{args.top_k}"
     for mode in modes:
         h1 = sum(1 for x in per_question if x["metrics"].get(f"{mode}_hit@1"))
         h5 = sum(1 for x in per_question if x["metrics"].get(f"{mode}_hit@5"))
+        mrr_values = ranking_values_by_mode[mode]["mrr"]
+        ndcg_values = ranking_values_by_mode[mode]["ndcg"]
+        top5_not_top1_rows = [x for x in per_question if x.get("hard_set_flags", {}).get(f"{mode}_top5_not_top1")]
+        miss_top5_rows = [x for x in per_question if x.get("hard_set_flags", {}).get(f"{mode}_miss_top5")]
+        hard_sets[mode]["top5_not_top1"] = top5_not_top1_rows
+        hard_sets[mode]["miss_top5"] = miss_top5_rows
         summary[mode] = {
             "count": total,
             "hit@1": h1,
             "hit@1_percent": round(score_percent(h1, total), 2),
             "hit@5": h5,
             "hit@5_percent": round(score_percent(h5, total), 2),
+            f"mrr@{args.top_k}": round(statistics.mean(mrr_values), 6) if mrr_values else 0.0,
+            f"ndcg@{args.top_k}": round(statistics.mean(ndcg_values), 6) if ndcg_values else 0.0,
+            "hard_set": {
+                "top5_not_top1_count": len(top5_not_top1_rows),
+                "miss_top5_count": len(miss_top5_rows),
+                "top5_k": hard_k,
+            },
         }
 
     distances = [
@@ -766,6 +946,7 @@ def main() -> None:
 
     result_payload = {
         "questions_file": str(args.questions),
+        "source_aliases_file": str(args.source_aliases) if args.source_aliases else "",
         "mode": args.mode,
         "top_k": args.top_k,
         "predictor": args.predictor,
@@ -775,6 +956,10 @@ def main() -> None:
             "sample_seed": args.sample_seed,
         },
         "summary": summary,
+        "hard_set": {
+            "dir": str(args.hard_set_dir),
+            "k": hard_k,
+        },
         "distance_stats": {
             "count": len(distances),
             "mean": round(statistics.mean(distances), 5) if distances else None,
@@ -803,10 +988,26 @@ def main() -> None:
         for row in per_question:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
+    for mode in modes:
+        top5_not_top1_file = args.hard_set_dir / f"{mode}_top5_not_top1.jsonl"
+        miss_top5_file = args.hard_set_dir / f"{mode}_miss_top5.jsonl"
+
+        with open(top5_not_top1_file, "w", encoding="utf-8") as f:
+            for row in hard_sets[mode]["top5_not_top1"]:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        with open(miss_top5_file, "w", encoding="utf-8") as f:
+            for row in hard_sets[mode]["miss_top5"]:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
     table = Table(title="Benchmark Scores")
     table.add_column("Mode")
     table.add_column("Hit@1")
     table.add_column("Hit@5")
+    table.add_column(f"MRR@{args.top_k}")
+    table.add_column(f"nDCG@{args.top_k}")
+    table.add_column("Top5¬Top1")
+    table.add_column("Miss@5")
     table.add_column("Count")
     for mode in modes:
         row = summary[mode]
@@ -814,12 +1015,17 @@ def main() -> None:
             mode,
             f"{row['hit@1']}/{row['count']} ({row['hit@1_percent']}%)",
             f"{row['hit@5']}/{row['count']} ({row['hit@5_percent']}%)",
+            f"{row[mrr_metric_key]:.4f}",
+            f"{row[ndcg_metric_key]:.4f}",
+            str(row["hard_set"]["top5_not_top1_count"]),
+            str(row["hard_set"]["miss_top5_count"]),
             str(row["count"]),
         )
 
     console.print(table)
     console.print(f"Summary: {args.results}")
     console.print(f"Per-question: {args.results_jsonl}")
+    console.print(f"Hard sets dir: {args.hard_set_dir}")
 
 
 if __name__ == "__main__":
