@@ -135,7 +135,9 @@ uv run python benchmark_run.py --mode both --predictor hybrid --hybrid-hyde-vari
 This web app keeps your existing `hybrid_retrieve.py` benchmark path untouched.
 It uses:
 - CPU query embeddings via `nomic-ai/CodeRankEmbed` from `transformers`
-- ONNX reranker `onnx-community/bge-reranker-base-ONNX` (`onnx/model_int8.onnx`)
+- BGE reranker via either:
+  - `flagembedding` backend (`BAAI/bge-reranker-base`, same stack as benchmark hybrid)
+  - `onnx` backend (`onnx-community/bge-reranker-base-ONNX`, CPU)
 - OpenAI Chat Completions for grounded answer generation over retrieved top-5 chunks
 
 ```bash
@@ -151,11 +153,52 @@ export WEB_NODES_FILE=data/pageindex/nodes.jsonl
 export WEB_CHROMA_DIR=data/chroma
 export WEB_COLLECTION=symfony_pageindex_summaries
 
+# optional reranker settings (defaults shown)
+export WEB_RERANK_BACKEND=onnx                # onnx | flagembedding
+export WEB_RERANK_MODEL=BAAI/bge-reranker-base
+export WEB_RERANK_DEVICE=cpu                  # e.g. cuda or cuda:0
+export WEB_RERANK_FP16=false                  # true for GPU fp16
+export WEB_RERANK_BATCH_SIZE=                 # optional integer batch size override
+
+# optional ONNX backend settings (used when WEB_RERANK_BACKEND=onnx)
+export WEB_RERANK_ONNX_REPO=onnx-community/bge-reranker-base-ONNX
+export WEB_RERANK_ONNX_FILE=onnx/model_int8.onnx
+export WEB_RERANK_ONNX_PATH=                  # optional local .onnx path override
+
 # optional: pin CodeRankEmbed custom-code revision for safety/reproducibility
 export WEB_EMBED_REVISION=3c4b60807d71f79b43f3c4363786d9493691f8b1
 
 # run web app
 uv run python web_app.py
+```
+
+Run with gunicorn:
+
+```bash
+uv run gunicorn --workers 1 --threads 1 --timeout 600 --bind 127.0.0.1:8091 --capture-output --error-logfile - --access-logfile - --log-level info web_app:app
+```
+
+Use GPU + fp16 reranker (example):
+
+```bash
+WEB_RERANK_DEVICE=cuda:0 WEB_RERANK_FP16=true \
+uv run gunicorn --workers 1 --threads 1 --timeout 600 --bind 127.0.0.1:8091 --capture-output --error-logfile - --access-logfile - --log-level info web_app:app
+```
+
+Use ONNX CPU reranker (example):
+
+```bash
+WEB_RERANK_BACKEND=onnx WEB_RERANK_BATCH_SIZE=16 \
+uv run gunicorn --workers 1 --threads 1 --timeout 600 --bind 127.0.0.1:8091 --capture-output --error-logfile - --access-logfile - --log-level info web_app:app
+```
+
+Run with a `.env` file:
+
+```bash
+set -a
+source .env
+set +a
+uv run gunicorn --workers 1 --threads 1 --timeout 600 --bind 127.0.0.1:8091 --capture-output --error-logfile - --access-logfile - --log-level info web_app:app
 ```
 
 Open: `http://localhost:8091`

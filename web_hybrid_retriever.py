@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Separate hybrid retriever for the web app (CPU transformers + ONNX reranker)."""
+"""Separate hybrid retriever for the web app (FlagEmbedding or ONNX reranker)."""
 
 from __future__ import annotations
 
@@ -9,23 +9,73 @@ from typing import Any, Callable
 
 import chromadb
 import numpy as np
-import onnxruntime as ort
 import torch
 from huggingface_hub import hf_hub_download, snapshot_download
 from transformers import AutoModel, AutoTokenizer
 
 from bm25_common import BM25Index, reciprocal_rank_fusion
 from pageindex_common import QUERY_PREFIX, RetrievedHit
-from rerank_common import split_text_for_rerank
+from rerank_common import BGEReranker, DEFAULT_RERANKER_DEVICE, DEFAULT_RERANKER_MODEL, split_text_for_rerank
 
 
 DEFAULT_CHROMA_DIR = Path("data/chroma")
 DEFAULT_COLLECTION = "symfony_pageindex_summaries"
 DEFAULT_QUERY_EMBED_MODEL = "nomic-ai/CodeRankEmbed"
 DEFAULT_QUERY_EMBED_REVISION = "3c4b60807d71f79b43f3c4363786d9493691f8b1"
-DEFAULT_RERANK_REPO = "onnx-community/bge-reranker-base-ONNX"
-DEFAULT_RERANK_FILE = "onnx/model_int8.onnx"
-DEFAULT_RERANK_BATCH_SIZE = 16
+DEFAULT_RERANK_BACKEND = "onnx"
+DEFAULT_RERANK_ONNX_REPO = "onnx-community/bge-reranker-base-ONNX"
+DEFAULT_RERANK_ONNX_FILE = "onnx/model_int8.onnx"
+
+
+class ONNXBGEReranker:
+    def __init__(
+        self,
+        *,
+        model_repo: str = DEFAULT_RERANK_ONNX_REPO,
+        model_file: str = DEFAULT_RERANK_ONNX_FILE,
+        onnx_path: str | None = None,
+        batch_size: int = 16,
+    ):
+        try:
+            import onnxruntime as ort
+        except Exception as exc:
+            raise RuntimeError(
+                "ONNX reranker requested but onnxruntime is not installed. "
+                "Install it in this env with `uv pip install onnxruntime`."
+            ) from exc
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model_repo)
+        self.batch_size = max(1, int(batch_size))
+        model_path = onnx_path or hf_hub_download(repo_id=model_repo, filename=model_file)
+        self.session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        self.input_names = {inp.name for inp in self.session.get_inputs()}
+        self.output_name = self.session.get_outputs()[0].name
+
+    def score(self, query: str, passages: list[str]) -> list[float]:
+        if not passages:
+            return []
+
+        out_scores: list[float] = []
+        for start in range(0, len(passages), self.batch_size):
+            batch = passages[start : start + self.batch_size]
+            pairs = [(query, p) for p in batch]
+            enc = self.tokenizer(
+                pairs,
+                padding=True,
+                truncation=True,
+                max_length=512,
+                return_tensors="np",
+            )
+            feeds: dict[str, np.ndarray] = {}
+            for key in ("input_ids", "attention_mask", "token_type_ids"):
+                if key in self.input_names and key in enc:
+                    feeds[key] = enc[key].astype(np.int64)
+
+            outputs = self.session.run([self.output_name], feeds)
+            logits = np.asarray(outputs[0]).reshape(-1)
+            scores = 1.0 / (1.0 + np.exp(-logits))
+            out_scores.extend(float(x) for x in scores)
+        return out_scores
 
 
 @dataclass
@@ -90,49 +140,6 @@ class TransformerCodeRankEmbedder:
         return vectors.tolist()
 
 
-class ONNXBGEReranker:
-    def __init__(
-        self,
-        *,
-        onnx_path: str | None = None,
-        model_repo: str = DEFAULT_RERANK_REPO,
-        model_file: str = DEFAULT_RERANK_FILE,
-    ):
-        self.tokenizer = AutoTokenizer.from_pretrained(model_repo)
-        self.batch_size = DEFAULT_RERANK_BATCH_SIZE
-        model_path = onnx_path
-        if not model_path:
-            model_path = hf_hub_download(repo_id=model_repo, filename=model_file)
-        self.session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
-        self.input_names = {inp.name for inp in self.session.get_inputs()}
-        self.output_name = self.session.get_outputs()[0].name
-
-    def score(self, query: str, passages: list[str]) -> list[float]:
-        if not passages:
-            return []
-        out_scores: list[float] = []
-        for start in range(0, len(passages), self.batch_size):
-            batch = passages[start : start + self.batch_size]
-            pairs = [(query, p) for p in batch]
-            enc = self.tokenizer(
-                pairs,
-                padding=True,
-                truncation=True,
-                max_length=512,
-                return_tensors="np",
-            )
-            feeds: dict[str, np.ndarray] = {}
-            for key in ("input_ids", "attention_mask", "token_type_ids"):
-                if key in self.input_names and key in enc:
-                    feeds[key] = enc[key].astype(np.int64)
-
-            outputs = self.session.run([self.output_name], feeds)
-            logits = np.asarray(outputs[0]).reshape(-1)
-            scores = 1.0 / (1.0 + np.exp(-logits))
-            out_scores.extend(float(x) for x in scores)
-        return out_scores
-
-
 class WebHybridRetriever:
     def __init__(
         self,
@@ -143,16 +150,21 @@ class WebHybridRetriever:
         query_embed_model: str = DEFAULT_QUERY_EMBED_MODEL,
         query_embed_revision: str = DEFAULT_QUERY_EMBED_REVISION,
         use_reranker: bool = True,
+        reranker_backend: str = DEFAULT_RERANK_BACKEND,
+        reranker_model: str = DEFAULT_RERANKER_MODEL,
+        reranker_device: str = DEFAULT_RERANKER_DEVICE,
+        reranker_fp16: bool = False,
+        reranker_batch_size: int | None = None,
+        reranker_onnx_repo: str = DEFAULT_RERANK_ONNX_REPO,
+        reranker_onnx_file: str = DEFAULT_RERANK_ONNX_FILE,
         reranker_onnx_path: str | None = None,
-        reranker_repo: str = DEFAULT_RERANK_REPO,
-        reranker_file: str = DEFAULT_RERANK_FILE,
         vector_top_n: int = 20,
-        candidate_cap: int = 15,
+        candidate_cap: int = 10,
         neighbor_depth: int = 1,
         siblings_per_node: int = 2,
         candidate_file_roots: int = 5,
         bm25_top_n: int = 20,
-        rrf_k: int = 60,
+        rrf_k: int = 40,
         rrf_vector_weight: float = 1.0,
         rrf_bm25_weight: float = 1.0,
         rerank_chunk_chars: int = 1500,
@@ -175,15 +187,36 @@ class WebHybridRetriever:
         self.rrf_bm25_weight = max(0.0, rrf_bm25_weight)
         self.rerank_chunk_chars = max(64, int(rerank_chunk_chars))
         self.rerank_chunk_overlap = max(0, min(int(rerank_chunk_overlap), self.rerank_chunk_chars - 1))
+        self.reranker_backend = (reranker_backend or DEFAULT_RERANK_BACKEND).strip().lower()
 
         self.reranker = None
         if self.use_reranker:
-            self._log("initializing ONNX reranker")
-            self.reranker = ONNXBGEReranker(
-                onnx_path=reranker_onnx_path,
-                model_repo=reranker_repo,
-                model_file=reranker_file,
-            )
+            if self.reranker_backend == "onnx":
+                onnx_batch_size = reranker_batch_size if reranker_batch_size is not None else 16
+                self._log(
+                    "initializing ONNX reranker "
+                    f"(repo={reranker_onnx_repo}, file={reranker_onnx_file}, "
+                    f"batch_size={onnx_batch_size})"
+                )
+                self.reranker = ONNXBGEReranker(
+                    model_repo=reranker_onnx_repo,
+                    model_file=reranker_onnx_file,
+                    onnx_path=reranker_onnx_path,
+                    batch_size=onnx_batch_size,
+                )
+            else:
+                self._log(
+                    "initializing FlagEmbedding reranker "
+                    f"(model={reranker_model}, device={reranker_device}, fp16={bool(reranker_fp16)}, "
+                    f"batch_size={reranker_batch_size})"
+                )
+                self.reranker = BGEReranker(
+                    reranker_model,
+                    device=reranker_device,
+                    use_fp16=reranker_fp16,
+                    normalize=True,
+                    batch_size=reranker_batch_size,
+                )
 
         self._log("opening Chroma collection")
         chroma_client = chromadb.PersistentClient(path=str(chroma_dir))
@@ -345,7 +378,7 @@ class WebHybridRetriever:
         if not passages:
             return {}
 
-        self._log(f"reranking {len(passages)} passages (batch={DEFAULT_RERANK_BATCH_SIZE})")
+        self._log(f"reranking {len(passages)} passages")
         scores = self.reranker.score(query, passages)
         by_id: dict[str, float] = {}
         for owner_id, score in zip(owner_ids, scores):
@@ -356,7 +389,7 @@ class WebHybridRetriever:
 
     def retrieve(self, query: str, *, top_k: int = 5) -> list[RetrievedHit]:
         self._log(f"retrieve start (top_k={top_k})")
-        evidence, file_scores = self._vector_shortlist(query)
+        evidence, _file_scores = self._vector_shortlist(query)
 
         seed_ranked = sorted(
             evidence.items(),
@@ -364,12 +397,11 @@ class WebHybridRetriever:
             reverse=True,
         )
         seed_scores = {node_id: ev.score for node_id, ev in seed_ranked[: self.candidate_cap]}
-        expanded_scores = self._expand_neighbors(seed_scores, file_scores)
 
         nodes_pool: dict[str, dict] = {}
         hybrid_scores: dict[str, float] = {}
 
-        for node_id, hybrid_score in expanded_scores.items():
+        for node_id, hybrid_score in seed_scores.items():
             node = self.nodes.get(node_id)
             if not node:
                 continue

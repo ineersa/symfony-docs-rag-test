@@ -29,14 +29,16 @@ class CitedChunk:
     text: str
 
 
-def _clip(text: str, limit: int) -> str:
+def _clip(text: str, limit: int | None) -> str:
     clean = (text or "").strip()
+    if limit is None:
+        return clean
     if len(clean) <= limit:
         return clean
     return clean[: limit - 3].rstrip() + "..."
 
 
-def build_cited_chunks(hits: list[RetrievedHit], *, max_docs: int = 5, text_chars: int = 2000) -> list[CitedChunk]:
+def build_cited_chunks(hits: list[RetrievedHit], *, max_docs: int = 5, text_chars: int | None = None) -> list[CitedChunk]:
     out: list[CitedChunk] = []
     for idx, h in enumerate(hits[:max_docs], start=1):
         out.append(
@@ -96,7 +98,7 @@ class RAGAnswerGenerator:
 
     def generate(self, query: str, hits: list[RetrievedHit]) -> tuple[str, list[CitedChunk]]:
         self._log("building cited chunks")
-        chunks = build_cited_chunks(hits, max_docs=5, text_chars=2200)
+        chunks = build_cited_chunks(hits, max_docs=5, text_chars=None)
         if not chunks:
             return NO_ANSWER_FALLBACK, []
 

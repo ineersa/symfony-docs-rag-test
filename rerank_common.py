@@ -32,6 +32,7 @@ class BGEReranker:
         device: str = DEFAULT_RERANKER_DEVICE,
         use_fp16: bool = False,
         normalize: bool = True,
+        batch_size: int | None = None,
     ):
         try:
             from FlagEmbedding import FlagReranker
@@ -45,13 +46,24 @@ class BGEReranker:
             kwargs["devices"] = [device]
         self._model = FlagReranker(model_name, **kwargs)
         self.normalize = normalize
+        self.batch_size = max(1, int(batch_size)) if batch_size is not None else None
 
     def score(self, query: str, passages: list[str]) -> list[float]:
         """Return normalized relevance scores in [0,1] when supported."""
         if not passages:
             return []
         pairs = [(query, p) for p in passages]
-        scores = self._model.compute_score(pairs, normalize=self.normalize)
+        try:
+            if self.batch_size is not None:
+                scores = self._model.compute_score(
+                    pairs,
+                    normalize=self.normalize,
+                    batch_size=self.batch_size,
+                )
+            else:
+                scores = self._model.compute_score(pairs, normalize=self.normalize)
+        except TypeError:
+            scores = self._model.compute_score(pairs, normalize=self.normalize)
         if scores is None:
             return []
         if isinstance(scores, (int, float)):

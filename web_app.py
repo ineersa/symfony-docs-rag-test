@@ -11,6 +11,7 @@ from datetime import datetime
 from uuid import uuid4
 
 from flask import Flask, render_template_string, request
+from pygments.lexer import default
 
 from pageindex_common import RetrievedHit, load_nodes
 from rag_answer import NO_ANSWER_FALLBACK, RAGAnswerGenerator
@@ -74,8 +75,15 @@ APP_TEMPLATE = """
       resize: vertical;
       background: #fff;
     }
+    .actions {
+      display: flex;
+      justify-content: flex-start;
+      align-items: center;
+      gap: 10px;
+    }
     button {
       width: fit-content;
+      min-height: 44px;
       border: 0;
       border-radius: 8px;
       padding: 9px 14px;
@@ -83,6 +91,29 @@ APP_TEMPLATE = """
       background: var(--accent);
       font-weight: 600;
       cursor: pointer;
+      appearance: none;
+      -webkit-appearance: none;
+      touch-action: manipulation;
+    }
+    button:disabled {
+      opacity: 0.7;
+      cursor: wait;
+    }
+    .loading-note {
+      display: none;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+    .loading-note.visible {
+      display: inline;
+    }
+    @media (max-width: 640px) {
+      .actions {
+        width: 100%;
+      }
+      button {
+        width: 100%;
+      }
     }
     .answer {
       white-space: pre-wrap;
@@ -119,16 +150,19 @@ APP_TEMPLATE = """
       <div class="muted">
         Hybrid search with `nomic-ai/CodeRankEmbed` embeddings over summaries for tree nodes + 
         BM25 search over node texts with RRF. 
-        Reranker `onnx-community/bge-reranker-base-ONNX` with int8 quantization.
+        Reranker `BAAI/bge-reranker-base` via FlagEmbedding/transformers or optional ONNX CPU backend.
         Answer generation done with Z.AI GLM-4-32B-0414-128K
       </div>
     </div>
 
     <div class="panel">
-      <form method="post">
+      <form id="search-form" method="post" action="/">
         <label for="query"><strong>Query</strong></label>
-        <textarea id="query" name="query" placeholder="Ask about Symfony docs...">{{ query or "" }}</textarea>
-        <button type="submit">Search</button>
+        <textarea id="query" name="query" placeholder="Ask about Symfony docs..." enterkeyhint="search">{{ query or "" }}</textarea>
+        <div class="actions">
+          <button id="search-btn" type="submit">Search</button>
+          <span id="loading-note" class="loading-note" role="status" aria-live="polite">Searching, please wait...</span>
+        </div>
       </form>
     </div>
 
@@ -158,6 +192,33 @@ APP_TEMPLATE = """
     </div>
     {% endif %}
   </div>
+  <script>
+    (() => {
+      const form = document.getElementById("search-form");
+      const button = document.getElementById("search-btn");
+      const loadingNote = document.getElementById("loading-note");
+      if (!form || !button || !loadingNote) {
+        return;
+      }
+
+      const submitForm = (event) => {
+        if (event) {
+          event.preventDefault();
+        }
+        if (form.dataset.submitting === "1") {
+          return;
+        }
+        form.dataset.submitting = "1";
+        button.disabled = true;
+        button.textContent = "Searching...";
+        loadingNote.classList.add("visible");
+        form.submit();
+      };
+
+      button.addEventListener("click", submitForm);
+      button.addEventListener("touchend", submitForm, { passive: false });
+    })();
+  </script>
 </body>
 </html>
 """
@@ -170,29 +231,29 @@ def _preview(text: str, limit: int = 120) -> str:
     return one_line[: limit - 3].rstrip() + "..."
 
 
-def _append_with_budget(parts: list[str], text: str, *, used_chars: int, budget_chars: int) -> int:
-    if used_chars >= budget_chars:
-        return used_chars
-    clean = (text or "").strip()
-    if not clean:
-        return used_chars
-    sep = "\n\n" if parts else ""
-    remaining = budget_chars - used_chars
-    if len(sep) + len(clean) <= remaining:
-        parts.append(clean)
-        return used_chars + len(sep) + len(clean)
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
-    room_for_text = remaining - len(sep)
-    if room_for_text <= 3:
-        return used_chars
-    parts.append(clean[: room_for_text - 3].rstrip() + "...")
-    return budget_chars
+
+def _env_int(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    val = raw.strip()
+    if not val:
+        return None
+    try:
+        return int(val)
+    except ValueError:
+        return None
 
 
 def _section_context_text(
     nodes: dict[str, dict],
     section_id: str,
-    max_chars: int,
     cache: dict[str, str],
 ) -> str:
     cached = cache.get(section_id)
@@ -201,11 +262,9 @@ def _section_context_text(
 
     parts: list[str] = []
     visited: set[str] = set()
-    used = 0
 
     def walk(node_id: str) -> None:
-        nonlocal used
-        if used >= max_chars or node_id in visited:
+        if node_id in visited:
             return
         visited.add(node_id)
 
@@ -213,21 +272,14 @@ def _section_context_text(
         if not node or node.get("kind") not in {"section", "top"}:
             return
 
-        used = _append_with_budget(
-            parts,
-            str(node.get("text") or ""),
-            used_chars=used,
-            budget_chars=max_chars,
-        )
-        if used >= max_chars:
-            return
+        text = str(node.get("text") or "")
+        if text.strip():
+            parts.append(text)
 
         for child_id in node.get("children", []):
             if not isinstance(child_id, str):
                 continue
             walk(child_id)
-            if used >= max_chars:
-                return
 
     walk(section_id)
     combined = "\n\n".join(parts).strip()
@@ -238,14 +290,13 @@ def _section_context_text(
 def _expand_hit_for_generation(
     hit: RetrievedHit,
     nodes: dict[str, dict],
-    section_context_chars: int,
     cache: dict[str, str],
 ) -> RetrievedHit:
     node = nodes.get(hit.id)
     if not node or node.get("kind") != "section":
         return hit
 
-    expanded_text = _section_context_text(nodes, hit.id, section_context_chars, cache)
+    expanded_text = _section_context_text(nodes, hit.id, cache)
     if not expanded_text or expanded_text == (hit.text or ""):
         return hit
 
@@ -278,14 +329,14 @@ def create_app() -> Flask:
     chroma_collection = os.getenv("WEB_COLLECTION", "symfony_pageindex_summaries")
     query_embed_model = os.getenv("WEB_EMBED_MODEL", "nomic-ai/CodeRankEmbed")
     query_embed_revision = os.getenv("WEB_EMBED_REVISION", DEFAULT_QUERY_EMBED_REVISION)
-    rerank_repo = os.getenv("WEB_RERANK_REPO", "onnx-community/bge-reranker-base-ONNX")
-    rerank_file = os.getenv("WEB_RERANK_FILE", "onnx/model_int8.onnx")
+    rerank_backend = os.getenv("WEB_RERANK_BACKEND", "onnx").strip() or "onnx"
+    rerank_model = os.getenv("WEB_RERANK_MODEL", "BAAI/bge-reranker-base")
+    rerank_device = os.getenv("WEB_RERANK_DEVICE", "cpu").strip() or "cpu"
+    rerank_fp16 = _env_bool("WEB_RERANK_FP16", default=False)
+    rerank_batch_size = _env_int("WEB_RERANK_BATCH_SIZE") or 8
+    rerank_onnx_repo = os.getenv("WEB_RERANK_ONNX_REPO", "onnx-community/bge-reranker-base-ONNX")
+    rerank_onnx_file = os.getenv("WEB_RERANK_ONNX_FILE", "onnx/model_int8.onnx")
     rerank_onnx_path = os.getenv("WEB_RERANK_ONNX_PATH")
-    try:
-        section_context_chars = max(500, int(os.getenv("WEB_SECTION_CONTEXT_CHARS", "12000")))
-    except ValueError:
-        section_context_chars = 12000
-
     openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
     openai_base_url = os.getenv("OPENAI_BASE_URL")
     openai_model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
@@ -304,9 +355,14 @@ def create_app() -> Flask:
         query_embed_model=query_embed_model,
         query_embed_revision=query_embed_revision,
         use_reranker=True,
+        reranker_backend=rerank_backend,
+        reranker_model=rerank_model,
+        reranker_device=rerank_device,
+        reranker_fp16=rerank_fp16,
+        reranker_batch_size=rerank_batch_size,
+        reranker_onnx_repo=rerank_onnx_repo,
+        reranker_onnx_file=rerank_onnx_file,
         reranker_onnx_path=rerank_onnx_path,
-        reranker_repo=rerank_repo,
-        reranker_file=rerank_file,
         logger=log_event,
     )
     log_event("startup: retriever ready")
@@ -356,7 +412,7 @@ def create_app() -> Flask:
                     log_event(f"request {req_id}: retrieval done ({len(hits)} hits)")
                     section_cache: dict[str, str] = {}
                     generation_hits = [
-                        _expand_hit_for_generation(h, nodes, section_context_chars, section_cache)
+                        _expand_hit_for_generation(h, nodes, section_cache)
                         for h in hits
                     ]
                     if generator is not None:
