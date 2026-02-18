@@ -11,3 +11,4 @@ wheels/
 
 # RAG data
 data/
+.idea/

@@ -227,14 +227,7 @@ class HybridRetriever:
         return str(node.get("text") or "").strip()
 
     def _node_bm25_text(self, node: dict[str, Any]) -> str:
-        return "\n".join(
-            [
-                str(node.get("source") or ""),
-                str(node.get("title") or ""),
-                str(node.get("breadcrumb") or ""),
-                str((node.get("text") or "")[:1800]),
-            ]
-        ).strip()
+        return str(node.get("text") or "")
 
     def _build_bm25_index(self) -> tuple[list[str], BM25Index]:
         eligible_nodes: list[dict[str, Any]] = [

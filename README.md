@@ -129,3 +129,38 @@ uv run python hybrid_retrieve.py --hyde-variants 2 "how to configure symfony rou
 # 4) Benchmark hybrid with HyDE enabled
 uv run python benchmark_run.py --mode both --predictor hybrid --hybrid-hyde-variants 2
 ```
+
+### Simple Web App (Separate from benchmark hybrid)
+
+This web app keeps your existing `hybrid_retrieve.py` benchmark path untouched.
+It uses:
+- CPU query embeddings via `nomic-ai/CodeRankEmbed` from `transformers`
+- ONNX reranker `onnx-community/bge-reranker-base-ONNX` (`onnx/model_int8.onnx`)
+- OpenAI Chat Completions for grounded answer generation over retrieved top-5 chunks
+
+```bash
+# required for generation
+export OPENAI_API_KEY=your_key
+
+# optional
+export OPENAI_MODEL=gpt-4.1-mini
+export OPENAI_BASE_URL=https://api.openai.com/v1
+
+# optional artifact paths (defaults shown)
+export WEB_NODES_FILE=data/pageindex/nodes.jsonl
+export WEB_CHROMA_DIR=data/chroma
+export WEB_COLLECTION=symfony_pageindex_summaries
+
+# optional: pin CodeRankEmbed custom-code revision for safety/reproducibility
+export WEB_EMBED_REVISION=3c4b60807d71f79b43f3c4363786d9493691f8b1
+
+# run web app
+uv run python web_app.py
+```
+
+Open: `http://localhost:8091`
+
+UI includes:
+- query input
+- generated answer with citations (e.g. `[D1]`)
+- expandable retrieved chunks with file+line in title and full chunk content inside
