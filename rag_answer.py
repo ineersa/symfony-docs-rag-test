@@ -74,6 +74,14 @@ def format_context_blocks(chunks: list[CitedChunk]) -> str:
     return "\n\n".join(blocks)
 
 
+def _extract_citations(text: str) -> set[str]:
+    cited: set[str] = set()
+    for block in re.findall(r"\[([^\]]+)\]", text or ""):
+        for match in re.finditer(r"(?i)\bD(\d+)\b", block):
+            cited.add(f"D{match.group(1)}")
+    return cited
+
+
 class RAGAnswerGenerator:
     def __init__(
         self,
@@ -96,6 +104,28 @@ class RAGAnswerGenerator:
         if self._logger:
             self._logger(f"[generator] {message}")
 
+    def _repair_citations(self, query: str, draft: str, context: str) -> str:
+        repair_prompt = (
+            "Rewrite the answer below to keep the same meaning but with valid citations.\n"
+            "Rules:\n"
+            "- Preserve factual content; do not add new facts.\n"
+            "- Use only citation format [D1], [D2], etc.\n"
+            "- Place citations at the end of factual sentences when possible.\n"
+            "- Do not mention chunks or reasoning process.\n"
+            "- If the answer is not supportable by the chunks, output exactly the fallback sentence.\n"
+            f"Fallback sentence:\n{NO_ANSWER_FALLBACK}\n\n"
+            f"Query:\n{query}\n\n"
+            f"Draft answer:\n{draft}\n\n"
+            f"Chunks:\n{context}"
+        )
+        resp = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": repair_prompt}],
+            temperature=0,
+            timeout=self._request_timeout_s,
+        )
+        return (resp.choices[0].message.content or "").strip()
+
     def generate(self, query: str, hits: list[RetrievedHit]) -> tuple[str, list[CitedChunk]]:
         self._log("building cited chunks")
         chunks = build_cited_chunks(hits, max_docs=5, text_chars=None)
@@ -108,6 +138,7 @@ class RAGAnswerGenerator:
             "You are under strict grounding policy. "
             "You must use ONLY facts explicitly present in the provided chunks. "
             "No prior knowledge, no guessing, no inferred internals. "
+            "Answer the user directly, never with process commentary. "
             "If evidence is missing, ambiguous, or partial, return exactly the fallback sentence. "
             "Any unsupported claim is forbidden."
         )
@@ -115,11 +146,12 @@ class RAGAnswerGenerator:
             "Use the chunks below to answer the user query.\n"
             "Hard rules (must follow all):\n"
             "1) Use only facts explicitly present in chunks.\n"
-            "2) Every factual sentence must end with one or more citations like [D1] or [D2][D4].\n"
-            "3) Do not mention symbols/class names/compiler passes/implementation details unless those exact terms appear in cited chunks.\n"
-            "4) If chunks do not directly answer the query, output exactly this sentence and nothing else:\n"
+            "2) Include citations for factual statements using [D1], [D2], etc. Prefer citations at sentence ends.\n"
+            "3) Do not mention chunks, context, grounding policy, or explain your reasoning process.\n"
+            "4) Include concrete Symfony terms from the chunks when useful (for example attributes, class/symbol names, config keys, or short code/config snippets). Never invent terms that are not in chunks.\n"
+            "5) If chunks do not directly answer the query, output exactly this sentence and nothing else:\n"
             f"{NO_ANSWER_FALLBACK}\n"
-            "5) Keep answer concise.\n\n"
+            "6) Keep answer concise and practical.\n\n"
             f"Query:\n{query}\n\n"
             f"Chunks:\n{context}"
         )
@@ -141,10 +173,16 @@ class RAGAnswerGenerator:
         if final_text.strip() == NO_ANSWER_FALLBACK:
             return NO_ANSWER_FALLBACK, chunks
 
-        if not re.search(r"\[(D\d+)\]", final_text):
-            return NO_ANSWER_FALLBACK, chunks
+        cited = _extract_citations(final_text)
+        if not cited:
+            self._log("no valid citations in draft; attempting citation repair")
+            repaired = self._repair_citations(query, final_text, context)
+            if repaired:
+                final_text = repaired
+                cited = _extract_citations(final_text)
+            if not cited:
+                return NO_ANSWER_FALLBACK, chunks
 
-        cited = set(re.findall(r"\[(D\d+)\]", final_text))
         allowed = {c.cite_id for c in chunks}
         if any(c not in allowed for c in cited):
             return NO_ANSWER_FALLBACK, chunks

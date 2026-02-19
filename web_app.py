@@ -11,12 +11,16 @@ from datetime import datetime
 from uuid import uuid4
 
 from flask import Flask, render_template_string, request
-from pygments.lexer import default
 
 from pageindex_common import RetrievedHit, load_nodes
 from rag_answer import NO_ANSWER_FALLBACK, RAGAnswerGenerator
 from web_hybrid_retriever import (
-    DEFAULT_QUERY_EMBED_REVISION,
+    DEFAULT_EMBED_BASE_URL,
+    DEFAULT_EMBED_MODEL,
+    DEFAULT_RERANK_CHUNK_CHARS,
+    DEFAULT_RERANK_CHUNK_OVERLAP,
+    DEFAULT_RERANK_BASE_URL,
+    DEFAULT_RERANK_MODEL,
     WebHybridRetriever,
 )
 
@@ -148,9 +152,9 @@ APP_TEMPLATE = """
     <div class="panel">
       <h1>Simple RAG for Symfony DOCS</h1>
       <div class="muted">
-        Hybrid search with `nomic-ai/CodeRankEmbed` embeddings over summaries for tree nodes + 
+        Hybrid search with local llama.cpp `CodeRankEmbed` embeddings over summaries for tree nodes + 
         BM25 search over node texts with RRF. 
-        Reranker `BAAI/bge-reranker-base` via FlagEmbedding/transformers or optional ONNX CPU backend.
+        Reranker `bge-reranker-base-q4_k_m.gguf` via local llama.cpp reranking server.
         Answer generation done with Z.AI GLM-4-32B-0414-128K
       </div>
     </div>
@@ -231,24 +235,17 @@ def _preview(text: str, limit: int = 120) -> str:
     return one_line[: limit - 3].rstrip() + "..."
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
+def _env_int(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None:
         return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _env_int(name: str) -> int | None:
-    raw = os.getenv(name)
-    if raw is None:
-        return None
-    val = raw.strip()
-    if not val:
-        return None
+    value = raw.strip()
+    if not value:
+        return default
     try:
-        return int(val)
+        return int(value)
     except ValueError:
-        return None
+        return default
 
 
 def _section_context_text(
@@ -327,16 +324,13 @@ def create_app() -> Flask:
     nodes_file = Path(os.getenv("WEB_NODES_FILE", "data/pageindex/nodes.jsonl"))
     chroma_dir = Path(os.getenv("WEB_CHROMA_DIR", "data/chroma"))
     chroma_collection = os.getenv("WEB_COLLECTION", "symfony_pageindex_summaries")
-    query_embed_model = os.getenv("WEB_EMBED_MODEL", "nomic-ai/CodeRankEmbed")
-    query_embed_revision = os.getenv("WEB_EMBED_REVISION", DEFAULT_QUERY_EMBED_REVISION)
-    rerank_backend = os.getenv("WEB_RERANK_BACKEND", "onnx").strip() or "onnx"
-    rerank_model = os.getenv("WEB_RERANK_MODEL", "BAAI/bge-reranker-base")
-    rerank_device = os.getenv("WEB_RERANK_DEVICE", "cpu").strip() or "cpu"
-    rerank_fp16 = _env_bool("WEB_RERANK_FP16", default=False)
-    rerank_batch_size = _env_int("WEB_RERANK_BATCH_SIZE") or 8
-    rerank_onnx_repo = os.getenv("WEB_RERANK_ONNX_REPO", "onnx-community/bge-reranker-base-ONNX")
-    rerank_onnx_file = os.getenv("WEB_RERANK_ONNX_FILE", "onnx/model_int8.onnx")
-    rerank_onnx_path = os.getenv("WEB_RERANK_ONNX_PATH")
+    embed_base_url = os.getenv("WEB_EMBED_BASE_URL", DEFAULT_EMBED_BASE_URL).strip() or DEFAULT_EMBED_BASE_URL
+    embed_model = os.getenv("WEB_EMBED_MODEL", DEFAULT_EMBED_MODEL).strip() or DEFAULT_EMBED_MODEL
+    rerank_base_url = os.getenv("WEB_RERANK_BASE_URL", DEFAULT_RERANK_BASE_URL).strip() or DEFAULT_RERANK_BASE_URL
+    rerank_model = os.getenv("WEB_RERANK_MODEL", DEFAULT_RERANK_MODEL).strip() or DEFAULT_RERANK_MODEL
+    llama_api_key = os.getenv("WEB_LLAMACPP_API_KEY", "").strip() or "not-needed"
+    rerank_chunk_chars = _env_int("WEB_RERANK_CHUNK_CHARS", DEFAULT_RERANK_CHUNK_CHARS)
+    rerank_chunk_overlap = _env_int("WEB_RERANK_CHUNK_OVERLAP", DEFAULT_RERANK_CHUNK_OVERLAP)
     openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
     openai_base_url = os.getenv("OPENAI_BASE_URL")
     openai_model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
@@ -352,17 +346,14 @@ def create_app() -> Flask:
         nodes,
         chroma_dir=chroma_dir,
         collection=chroma_collection,
-        query_embed_model=query_embed_model,
-        query_embed_revision=query_embed_revision,
+        embed_base_url=embed_base_url,
+        embed_model=embed_model,
+        rerank_base_url=rerank_base_url,
         use_reranker=True,
-        reranker_backend=rerank_backend,
-        reranker_model=rerank_model,
-        reranker_device=rerank_device,
-        reranker_fp16=rerank_fp16,
-        reranker_batch_size=rerank_batch_size,
-        reranker_onnx_repo=rerank_onnx_repo,
-        reranker_onnx_file=rerank_onnx_file,
-        reranker_onnx_path=rerank_onnx_path,
+        rerank_model=rerank_model,
+        llama_api_key=llama_api_key,
+        rerank_chunk_chars=rerank_chunk_chars,
+        rerank_chunk_overlap=rerank_chunk_overlap,
         logger=log_event,
     )
     log_event("startup: retriever ready")

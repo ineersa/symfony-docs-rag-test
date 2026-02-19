@@ -1,0 +1,41 @@
+services:
+  llamacpp-embed:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    restart: always
+    ports:
+      - "8059:8059"
+    volumes:
+      - /var/models:/models:ro
+    command:
+      - -m
+      - /models/coderankembed-q8_0.gguf
+      - --embedding
+      - --pooling
+      - cls
+      - -c
+      - "2048"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8059"
+
+  llamacpp-rerank:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    restart: always
+    ports:
+      - "8060:8060"
+    volumes:
+      - /var/models:/models:ro
+    command:
+      - -m
+      - /models/bge-reranker-base-q4_k_m.gguf
+      - --embedding
+      - --pooling
+      - rank
+      - --reranking
+      - -c
+      - "2048"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8060"

@@ -1,81 +1,101 @@
 #!/usr/bin/env python3
-"""Separate hybrid retriever for the web app (FlagEmbedding or ONNX reranker)."""
+"""Hybrid retriever for the web app using llama.cpp embedding + reranking APIs."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
+import math
 from pathlib import Path
 from typing import Any, Callable
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 import chromadb
-import numpy as np
-import torch
-from huggingface_hub import hf_hub_download, snapshot_download
-from transformers import AutoModel, AutoTokenizer
+from openai import OpenAI
 
 from bm25_common import BM25Index, reciprocal_rank_fusion
 from pageindex_common import QUERY_PREFIX, RetrievedHit
-from rerank_common import BGEReranker, DEFAULT_RERANKER_DEVICE, DEFAULT_RERANKER_MODEL, split_text_for_rerank
+from rerank_common import split_text_for_rerank
 
 
 DEFAULT_CHROMA_DIR = Path("data/chroma")
 DEFAULT_COLLECTION = "symfony_pageindex_summaries"
-DEFAULT_QUERY_EMBED_MODEL = "nomic-ai/CodeRankEmbed"
-DEFAULT_QUERY_EMBED_REVISION = "3c4b60807d71f79b43f3c4363786d9493691f8b1"
-DEFAULT_RERANK_BACKEND = "onnx"
-DEFAULT_RERANK_ONNX_REPO = "onnx-community/bge-reranker-base-ONNX"
-DEFAULT_RERANK_ONNX_FILE = "onnx/model_int8.onnx"
+DEFAULT_EMBED_BASE_URL = "http://127.0.0.1:8059/v1"
+DEFAULT_RERANK_BASE_URL = "http://127.0.0.1:8060"
+DEFAULT_EMBED_MODEL = "CodeRankEmbed"
+DEFAULT_RERANK_MODEL = "bge-reranker-base-q4_k_m.gguf"
+DEFAULT_RERANK_CHUNK_CHARS = 1000
+DEFAULT_RERANK_CHUNK_OVERLAP = 200
 
 
-class ONNXBGEReranker:
+class LlamaCppReranker:
     def __init__(
         self,
         *,
-        model_repo: str = DEFAULT_RERANK_ONNX_REPO,
-        model_file: str = DEFAULT_RERANK_ONNX_FILE,
-        onnx_path: str | None = None,
-        batch_size: int = 16,
+        base_url: str = DEFAULT_RERANK_BASE_URL,
+        model: str = DEFAULT_RERANK_MODEL,
+        api_key: str = "not-needed",
     ):
-        try:
-            import onnxruntime as ort
-        except Exception as exc:
-            raise RuntimeError(
-                "ONNX reranker requested but onnxruntime is not installed. "
-                "Install it in this env with `uv pip install onnxruntime`."
-            ) from exc
-
-        self.tokenizer = AutoTokenizer.from_pretrained(model_repo)
-        self.batch_size = max(1, int(batch_size))
-        model_path = onnx_path or hf_hub_download(repo_id=model_repo, filename=model_file)
-        self.session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
-        self.input_names = {inp.name for inp in self.session.get_inputs()}
-        self.output_name = self.session.get_outputs()[0].name
+        self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.api_key = api_key
 
     def score(self, query: str, passages: list[str]) -> list[float]:
         if not passages:
             return []
 
-        out_scores: list[float] = []
-        for start in range(0, len(passages), self.batch_size):
-            batch = passages[start : start + self.batch_size]
-            pairs = [(query, p) for p in batch]
-            enc = self.tokenizer(
-                pairs,
-                padding=True,
-                truncation=True,
-                max_length=512,
-                return_tensors="np",
-            )
-            feeds: dict[str, np.ndarray] = {}
-            for key in ("input_ids", "attention_mask", "token_type_ids"):
-                if key in self.input_names and key in enc:
-                    feeds[key] = enc[key].astype(np.int64)
+        payload = {
+            "model": self.model,
+            "query": query,
+            "documents": passages,
+            "top_n": len(passages),
+        }
+        endpoint = f"{self.base_url}/v1/rerank"
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
 
-            outputs = self.session.run([self.output_name], feeds)
-            logits = np.asarray(outputs[0]).reshape(-1)
-            scores = 1.0 / (1.0 + np.exp(-logits))
-            out_scores.extend(float(x) for x in scores)
-        return out_scores
+        req = urlrequest.Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with urlrequest.urlopen(req, timeout=60) as resp:
+                body = resp.read().decode("utf-8")
+        except urlerror.HTTPError as exc:
+            details = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"llama.cpp rerank HTTP {exc.code}: {details}") from exc
+        except urlerror.URLError as exc:
+            raise RuntimeError(f"llama.cpp rerank request failed: {exc.reason}") from exc
+
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("llama.cpp rerank returned invalid JSON") from exc
+
+        results = data.get("results")
+        if not isinstance(results, list):
+            raise RuntimeError("llama.cpp rerank response missing 'results'")
+
+        scores = [0.0 for _ in passages]
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            idx = item.get("index")
+            if not isinstance(idx, int) or idx < 0 or idx >= len(passages):
+                continue
+            raw_score = item.get("relevance_score", item.get("score", 0.0))
+            try:
+                score = float(raw_score)
+                if score < 0.0 or score > 1.0:
+                    score = 1.0 / (1.0 + math.exp(-score))
+                scores[idx] = score
+            except (TypeError, ValueError):
+                continue
+        return scores
 
 
 @dataclass
@@ -86,34 +106,16 @@ class _NodeEvidence:
     best_rank: int = 10_000
 
 
-class TransformerCodeRankEmbedder:
+class LlamaCppEmbedder:
     def __init__(
         self,
-        model_name: str = DEFAULT_QUERY_EMBED_MODEL,
         *,
-        revision: str = DEFAULT_QUERY_EMBED_REVISION,
+        base_url: str = DEFAULT_EMBED_BASE_URL,
+        model: str = DEFAULT_EMBED_MODEL,
+        api_key: str = "not-needed",
     ):
-        local_model_dir = snapshot_download(
-            repo_id=model_name,
-            revision=revision,
-            allow_patterns=[
-                "*.json",
-                "*.txt",
-                "*.py",
-                "*.safetensors",
-                "*.bin",
-            ],
-        )
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            local_model_dir,
-            trust_remote_code=True,
-        )
-        self.model = AutoModel.from_pretrained(
-            local_model_dir,
-            trust_remote_code=True,
-        )
-        self.model.eval()
-        self.max_length = 8192
+        self.model = model
+        self.client = OpenAI(base_url=base_url.rstrip("/"), api_key=api_key)
 
     @staticmethod
     def _enriched_prefixed_query(query: str) -> str:
@@ -126,18 +128,8 @@ class TransformerCodeRankEmbedder:
         if not queries:
             return []
         prefixed = [self._enriched_prefixed_query(q) for q in queries]
-        with torch.inference_mode():
-            encoded = self.tokenizer(
-                prefixed,
-                padding=True,
-                truncation=True,
-                max_length=self.max_length,
-                return_tensors="pt",
-            )
-            out = self.model(**encoded)
-            embeddings = out.last_hidden_state[:, 0, :]
-            vectors = embeddings.detach().cpu().float().numpy()
-        return vectors.tolist()
+        response = self.client.embeddings.create(input=prefixed, model=self.model)
+        return [item.embedding for item in response.data]
 
 
 class WebHybridRetriever:
@@ -147,17 +139,12 @@ class WebHybridRetriever:
         *,
         chroma_dir: Path = DEFAULT_CHROMA_DIR,
         collection: str = DEFAULT_COLLECTION,
-        query_embed_model: str = DEFAULT_QUERY_EMBED_MODEL,
-        query_embed_revision: str = DEFAULT_QUERY_EMBED_REVISION,
+        embed_base_url: str = DEFAULT_EMBED_BASE_URL,
+        embed_model: str = DEFAULT_EMBED_MODEL,
+        rerank_base_url: str = DEFAULT_RERANK_BASE_URL,
+        rerank_model: str = DEFAULT_RERANK_MODEL,
+        llama_api_key: str = "not-needed",
         use_reranker: bool = True,
-        reranker_backend: str = DEFAULT_RERANK_BACKEND,
-        reranker_model: str = DEFAULT_RERANKER_MODEL,
-        reranker_device: str = DEFAULT_RERANKER_DEVICE,
-        reranker_fp16: bool = False,
-        reranker_batch_size: int | None = None,
-        reranker_onnx_repo: str = DEFAULT_RERANK_ONNX_REPO,
-        reranker_onnx_file: str = DEFAULT_RERANK_ONNX_FILE,
-        reranker_onnx_path: str | None = None,
         vector_top_n: int = 20,
         candidate_cap: int = 10,
         neighbor_depth: int = 1,
@@ -167,14 +154,14 @@ class WebHybridRetriever:
         rrf_k: int = 40,
         rrf_vector_weight: float = 1.0,
         rrf_bm25_weight: float = 1.0,
-        rerank_chunk_chars: int = 1500,
-        rerank_chunk_overlap: int = 500,
+        rerank_chunk_chars: int = DEFAULT_RERANK_CHUNK_CHARS,
+        rerank_chunk_overlap: int = DEFAULT_RERANK_CHUNK_OVERLAP,
         logger: Callable[[str], None] | None = None,
     ):
         self.nodes = nodes
         self._logger = logger
-        self._log("initializing query embedder")
-        self.embedder = TransformerCodeRankEmbedder(query_embed_model, revision=query_embed_revision)
+        self._log(f"initializing llama.cpp embedder (base_url={embed_base_url}, model={embed_model})")
+        self.embedder = LlamaCppEmbedder(base_url=embed_base_url, model=embed_model, api_key=llama_api_key)
         self.use_reranker = bool(use_reranker)
         self.vector_top_n = max(1, vector_top_n)
         self.candidate_cap = max(1, candidate_cap)
@@ -187,36 +174,11 @@ class WebHybridRetriever:
         self.rrf_bm25_weight = max(0.0, rrf_bm25_weight)
         self.rerank_chunk_chars = max(64, int(rerank_chunk_chars))
         self.rerank_chunk_overlap = max(0, min(int(rerank_chunk_overlap), self.rerank_chunk_chars - 1))
-        self.reranker_backend = (reranker_backend or DEFAULT_RERANK_BACKEND).strip().lower()
 
         self.reranker = None
         if self.use_reranker:
-            if self.reranker_backend == "onnx":
-                onnx_batch_size = reranker_batch_size if reranker_batch_size is not None else 16
-                self._log(
-                    "initializing ONNX reranker "
-                    f"(repo={reranker_onnx_repo}, file={reranker_onnx_file}, "
-                    f"batch_size={onnx_batch_size})"
-                )
-                self.reranker = ONNXBGEReranker(
-                    model_repo=reranker_onnx_repo,
-                    model_file=reranker_onnx_file,
-                    onnx_path=reranker_onnx_path,
-                    batch_size=onnx_batch_size,
-                )
-            else:
-                self._log(
-                    "initializing FlagEmbedding reranker "
-                    f"(model={reranker_model}, device={reranker_device}, fp16={bool(reranker_fp16)}, "
-                    f"batch_size={reranker_batch_size})"
-                )
-                self.reranker = BGEReranker(
-                    reranker_model,
-                    device=reranker_device,
-                    use_fp16=reranker_fp16,
-                    normalize=True,
-                    batch_size=reranker_batch_size,
-                )
+            self._log(f"initializing llama.cpp reranker (base_url={rerank_base_url}, model={rerank_model})")
+            self.reranker = LlamaCppReranker(base_url=rerank_base_url, model=rerank_model, api_key=llama_api_key)
 
         self._log("opening Chroma collection")
         chroma_client = chromadb.PersistentClient(path=str(chroma_dir))
