@@ -13,7 +13,7 @@ from rich.console import Console
 from rich.panel import Panel
 
 from bm25_common import BM25Index, reciprocal_rank_fusion
-from pageindex_common import QUERY_PREFIX, RetrievedHit, load_nodes, parse_json_obj
+from pageindex_common import QUERY_PREFIX, RetrievedHit, lexical_score, load_nodes, parse_json_obj
 from rerank_common import (
     BGEReranker,
     DEFAULT_RERANK_CHUNK_CHARS,
@@ -40,6 +40,16 @@ DEFAULT_HYDE_VARIANT_WEIGHT = 0.7
 DEFAULT_HYDE_TEMPERATURE = 0.3
 DEFAULT_HYDE_MAX_CHARS = 420
 DEFAULT_HYDE_JSON_RETRIES = 2
+DEFAULT_STRUCTURAL_RRF_WEIGHT = 0.7
+
+STRUCTURAL_QUERY_TERMS = (
+    "toctree",
+    "maxdepth",
+    "table of contents",
+    "subpage",
+    "index.rst",
+    "title of the section",
+)
 
 
 @dataclass
@@ -126,6 +136,7 @@ class HybridRetriever:
 
         self.file_node_by_source = self._index_file_roots()
         self.bm25_node_ids, self.bm25 = self._build_bm25_index()
+        self.source_section_nodes, self.source_node_pos = self._build_source_section_neighbors()
 
     def consume_usage(self) -> dict[str, int]:
         out = dict(self._usage)
@@ -229,6 +240,21 @@ class HybridRetriever:
     def _node_bm25_text(self, node: dict[str, Any]) -> str:
         return str(node.get("text") or "")
 
+    def _node_structural_text(self, node: dict[str, Any]) -> str:
+        return "\n".join(
+            [
+                str(node.get("source") or ""),
+                str(node.get("title") or ""),
+                str(node.get("breadcrumb") or ""),
+                str(node.get("text") or ""),
+            ]
+        ).strip()
+
+    @staticmethod
+    def _is_structural_query(query: str) -> bool:
+        q = (query or "").lower()
+        return any(term in q for term in STRUCTURAL_QUERY_TERMS)
+
     def _build_bm25_index(self) -> tuple[list[str], BM25Index]:
         eligible_nodes: list[dict[str, Any]] = [
             n
@@ -240,6 +266,31 @@ class HybridRetriever:
         texts = [self._node_bm25_text(n) for n in eligible_nodes]
         return node_ids, BM25Index(texts)
 
+    def _build_source_section_neighbors(self) -> tuple[dict[str, list[str]], dict[str, int]]:
+        by_source: dict[str, list[dict[str, Any]]] = {}
+        for node in self.nodes.values():
+            source = str(node.get("source") or "")
+            if not source:
+                continue
+            if node.get("kind") not in {"section", "top"}:
+                continue
+            text = str(node.get("text") or "").strip()
+            if not text:
+                continue
+            line_start = node.get("line_start")
+            start = int(line_start) if isinstance(line_start, int) else 10_000_000
+            by_source.setdefault(source, []).append({"id": str(node.get("id", "")), "line_start": start})
+
+        ordered: dict[str, list[str]] = {}
+        pos: dict[str, int] = {}
+        for source, rows in by_source.items():
+            rows.sort(key=lambda r: r["line_start"])
+            ids = [str(r["id"]) for r in rows if r.get("id")]
+            ordered[source] = ids
+            for idx, node_id in enumerate(ids):
+                pos[node_id] = idx
+        return ordered, pos
+
     def _bm25_rank(self, query: str) -> list[str]:
         hits = self.bm25.search(query, self.bm25_top_n)
         out: list[str] = []
@@ -247,6 +298,63 @@ class HybridRetriever:
             if 0 <= h.index < len(self.bm25_node_ids):
                 out.append(self.bm25_node_ids[h.index])
         return out
+
+    def _structural_rank(self, query: str) -> list[str]:
+        if not self._is_structural_query(query):
+            return []
+
+        candidates = [
+            n
+            for n in self.nodes.values()
+            if n.get("source")
+            and str(n.get("source", "")).endswith("index.rst")
+            and n.get("kind") in {"top", "section", "file"}
+        ]
+        ranked = sorted(candidates, key=lambda n: lexical_score(query, self._node_structural_text(n)), reverse=True)
+        return [str(n.get("id", "")) for n in ranked[: self.bm25_top_n] if str(n.get("id", ""))]
+
+    def _augment_candidates_with_same_source_neighbors(
+        self,
+        candidate_ids: list[str],
+        *,
+        max_extra: int,
+    ) -> list[str]:
+        if max_extra <= 0 or not candidate_ids:
+            return candidate_ids
+
+        out = list(candidate_ids)
+        seen = set(out)
+        extras: list[str] = []
+
+        for node_id in candidate_ids:
+            node = self.nodes.get(node_id)
+            if not node:
+                continue
+            source = str(node.get("source") or "")
+            if not source:
+                continue
+            ordered = self.source_section_nodes.get(source) or []
+            if not ordered:
+                continue
+
+            pos = self.source_node_pos.get(node_id)
+            if pos is None:
+                probe_positions = [0, 1]
+            else:
+                probe_positions = [pos - 1, pos + 1, pos - 2, pos + 2]
+
+            for p in probe_positions:
+                if p < 0 or p >= len(ordered):
+                    continue
+                extra_id = ordered[p]
+                if extra_id in seen:
+                    continue
+                seen.add(extra_id)
+                extras.append(extra_id)
+                if len(extras) >= max_extra:
+                    return out + extras
+
+        return out + extras
 
     def _vector_shortlist(self, query: str) -> tuple[dict[str, _NodeEvidence], dict[str, float]]:
         query_texts = [query]
@@ -446,7 +554,16 @@ class HybridRetriever:
             hybrid_scores[node_id] = hybrid_score
 
         bm25_ids = self._bm25_rank(query)
+        structural_ids = self._structural_rank(query)
         for node_id in bm25_ids:
+            node = self.nodes.get(node_id)
+            if not node:
+                continue
+            if node.get("kind") not in {"section", "top", "file"}:
+                continue
+            nodes_pool[node_id] = node
+
+        for node_id in structural_ids:
             node = self.nodes.get(node_id)
             if not node:
                 continue
@@ -459,14 +576,30 @@ class HybridRetriever:
 
         sorted_hybrid = sorted(hybrid_scores.items(), key=lambda x: x[1], reverse=True)
         hybrid_ids = [nid for nid, _ in sorted_hybrid]
-        fused = reciprocal_rank_fusion(
-            [hybrid_ids, bm25_ids],
-            rrf_k=self.rrf_k,
-            weights=[self.rrf_vector_weight, self.rrf_bm25_weight],
-        )
+        rank_lists = [hybrid_ids, bm25_ids]
+        rank_weights = [self.rrf_vector_weight, self.rrf_bm25_weight]
+        if structural_ids:
+            rank_lists.append(structural_ids)
+            rank_weights.append(DEFAULT_STRUCTURAL_RRF_WEIGHT)
+
+        fused = reciprocal_rank_fusion(rank_lists, rrf_k=self.rrf_k, weights=rank_weights)
         final_scores = {nid: score for nid, score in fused}
         candidate_ids = [nid for nid, _ in fused if nid in nodes_pool][: self.candidate_cap]
-        candidates = [nodes_pool[nid] for nid in candidate_ids]
+        if self.use_reranker and self.reranker:
+            candidate_ids = self._augment_candidates_with_same_source_neighbors(
+                candidate_ids,
+                max_extra=max(4, self.candidate_cap // 2),
+            )
+            for nid in candidate_ids:
+                if nid in nodes_pool:
+                    continue
+                node = self.nodes.get(nid)
+                if not node:
+                    continue
+                if node.get("kind") not in {"section", "top", "file"}:
+                    continue
+                nodes_pool[nid] = node
+        candidates = [nodes_pool[nid] for nid in candidate_ids if nid in nodes_pool]
 
         rerank_scores = self._rerank_candidates(query, candidates) if self.use_reranker else {}
         reranked_ids: list[str] = []
